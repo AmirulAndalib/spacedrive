@@ -1,377 +1,426 @@
-use sd_crypto::keys::keymanager::{StoredKey, StoredKeyType};
-use sd_crypto::primitives::SECRET_KEY_IDENTIFIER;
-use sd_crypto::types::{Algorithm, HashingAlgorithm, SecretKeyString};
-use sd_crypto::{Error, Protected};
-use serde::Deserialize;
-use specta::Type;
-use std::{path::PathBuf, str::FromStr};
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use uuid::Uuid;
+use super::utils::library;
+use super::{Ctx, SanitizedNodeConfig, R};
+use rspc::{alpha::AlphaRouter, ErrorCode};
+use sd_crypto::cookie::CookieCipher;
+use serde_json::{json, Map, Value};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::RwLock;
+use tracing::{debug, error};
 
-use crate::util::db::write_storedkey_to_db;
-use crate::{invalidate_query, prisma::key};
-
-use super::{utils::LibraryRequest, RouterBuilder};
-
-#[derive(Type, Deserialize)]
-pub struct KeyAddArgs {
-	algorithm: Algorithm,
-	hashing_algorithm: HashingAlgorithm,
-	key: Protected<String>,
-	library_sync: bool,
-	automount: bool,
+#[derive(Clone)]
+struct CipherCache {
+	uuid: String,
+	cipher: CookieCipher,
 }
 
-#[derive(Type, Deserialize)]
-pub struct UnlockKeyManagerArgs {
-	password: Protected<String>,
-	secret_key: Protected<String>,
+async fn get_cipher(
+	node: &Ctx,
+	cache: Arc<RwLock<Option<CipherCache>>>,
+) -> Result<CookieCipher, rspc::Error> {
+	let config = SanitizedNodeConfig::from(node.config.get().await);
+	let uuid = config.id.to_string();
+
+	{
+		let cache_read = cache.read().await;
+		if let Some(ref cache) = *cache_read {
+			if cache.uuid == uuid {
+				return Ok(cache.cipher.clone());
+			}
+		}
+	}
+
+	let uuid_key = CookieCipher::generate_key_from_string(&uuid).map_err(|e| {
+		error!("Failed to generate key: {:?}", e.to_string());
+		rspc::Error::new(
+			ErrorCode::InternalServerError,
+			"Failed to generate key".to_string(),
+		)
+	})?;
+
+	let cipher = CookieCipher::new(&uuid_key).map_err(|e| {
+		error!("Failed to create cipher: {:?}", e.to_string());
+		rspc::Error::new(
+			ErrorCode::InternalServerError,
+			"Failed to create cipher".to_string(),
+		)
+	})?;
+
+	{
+		let mut cache_write = cache.write().await;
+		*cache_write = Some(CipherCache {
+			uuid,
+			cipher: cipher.clone(),
+		});
+	}
+
+	Ok(cipher)
 }
 
-#[derive(Type, Deserialize)]
-pub struct RestoreBackupArgs {
-	password: Protected<String>,
-	secret_key: Protected<String>,
-	path: PathBuf,
+async fn read_file(path: &Path) -> Result<Vec<u8>, rspc::Error> {
+	tokio::fs::read(path).await.map_err(|e| {
+		error!("Failed to read file: {:?}", e.to_string());
+		rspc::Error::new(
+			ErrorCode::InternalServerError,
+			format!("Failed to read file {:?}", path),
+		)
+	})
 }
 
-#[derive(Type, Deserialize)]
-pub struct MasterPasswordChangeArgs {
-	password: Protected<String>,
-	algorithm: Algorithm,
-	hashing_algorithm: HashingAlgorithm,
+async fn write_file(path: &Path, data: &[u8]) -> Result<(), rspc::Error> {
+	let mut file = tokio::fs::OpenOptions::new()
+		.write(true)
+		.create(true)
+		.truncate(true)
+		.open(path)
+		.await
+		.map_err(|e| {
+			error!("Failed to open file: {:?}", e.to_string());
+			rspc::Error::new(
+				ErrorCode::InternalServerError,
+				format!("Failed to open file {:?}", path),
+			)
+		})?;
+	file.write_all(data).await.map_err(|e| {
+		error!("Failed to write to file: {:?}", e.to_string());
+		rspc::Error::new(
+			ErrorCode::InternalServerError,
+			format!("Failed to write to file {:?}", path),
+		)
+	})
 }
 
-#[derive(Type, Deserialize)]
-pub struct AutomountUpdateArgs {
-	uuid: Uuid,
-	status: bool,
+fn sanitize_path(base_dir: &Path, path: &Path) -> Result<PathBuf, rspc::Error> {
+	let abs_base = base_dir.canonicalize().map_err(|e| {
+		error!("Failed to canonicalize base directory: {:?}", e.to_string());
+		rspc::Error::new(
+			ErrorCode::InternalServerError,
+			"Failed to canonicalize base directory".to_string(),
+		)
+	})?;
+	let abs_path = abs_base.join(path).canonicalize().map_err(|e| {
+		error!("Failed to canonicalize path: {:?}", e.to_string());
+		rspc::Error::new(
+			ErrorCode::InternalServerError,
+			"Failed to canonicalize path".to_string(),
+		)
+	})?;
+	if abs_path.starts_with(&abs_base) {
+		Ok(abs_path)
+	} else {
+		error!("Path injection attempt detected: {:?}", abs_path);
+		Err(rspc::Error::new(
+			ErrorCode::InternalServerError,
+			"Invalid path".to_string(),
+		))
+	}
 }
 
-pub(crate) fn mount() -> RouterBuilder {
-	RouterBuilder::new()
-		.library_query("list", |t| {
-			t(|_, _: (), library| async move { Ok(library.key_manager.dump_keystore()) })
-		})
-		// do not unlock the key manager until this route returns true
-		.library_query("isUnlocked", |t| {
-			t(|_, _: (), library| async move { Ok(library.key_manager.is_unlocked().await) })
-		})
-		// this is so we can show the key as mounted in the UI
-		.library_query("listMounted", |t| {
-			t(|_, _: (), library| async move { Ok(library.key_manager.get_mounted_uuids()) })
-		})
-		.library_query("getKey", |t| {
-			t(|_, key_uuid: Uuid, library| async move {
-				Ok(library
-					.key_manager
-					.get_key(key_uuid)
-					.await?
-					.expose()
-					.clone())
-			})
-		})
-		.library_mutation("mount", |t| {
-			t(|_, key_uuid: Uuid, library| async move {
-				library.key_manager.mount(key_uuid).await?;
-				// we also need to dispatch jobs that automatically decrypt preview media and metadata here
-				invalidate_query!(library, "keys.listMounted");
-				Ok(())
-			})
-		})
-		.library_query("getSecretKey", |t| {
-			t(|_, _: (), library| async move {
-				if library
-					.key_manager
-					.keyring_contains_valid_secret_key(library.id)
-					.await
-					.is_ok()
-				{
-					Ok(Some(
-						library
-							.key_manager
-							.keyring_retrieve(library.id, SECRET_KEY_IDENTIFIER.to_string())
-							.await?
-							.expose()
-							.clone(),
-					))
-				} else {
-					Ok(None)
-				}
-			})
-		})
-		.library_mutation("unmount", |t| {
-			t(|_, key_uuid: Uuid, library| async move {
-				library.key_manager.unmount(key_uuid)?;
-				// we also need to delete all in-memory decrypted data associated with this key
-				invalidate_query!(library, "keys.listMounted");
-				Ok(())
-			})
-		})
-		.library_mutation("clearMasterPassword", |t| {
-			t(|_, _: (), library| async move {
-				// This technically clears the root key, but it means the same thing to the frontend
-				library.key_manager.clear_root_key().await?;
+pub(crate) fn mount() -> AlphaRouter<Ctx> {
+	let cipher_cache = Arc::new(RwLock::new(None));
 
-				invalidate_query!(library, "keys.isUnlocked");
-				Ok(())
-			})
-		})
-		.library_mutation("syncKeyToLibrary", |t| {
-			t(|_, key_uuid: Uuid, library| async move {
-				let key = library.key_manager.sync_to_database(key_uuid).await?;
+	R.router()
+		.procedure("get", {
+			let cipher_cache = cipher_cache.clone();
+			R.query(move |node, _: ()| {
+				let cipher_cache = cipher_cache.clone();
+				async move {
+					let base_dir = node.config.data_directory();
+					let path = sanitize_path(&base_dir, Path::new(".sdks"))?;
+					let data = read_file(&path).await?;
+					let cipher = get_cipher(&node, cipher_cache).await?;
 
-				// does not check that the key doesn't exist before writing
-				write_storedkey_to_db(&library.db, &key).await?;
-
-				invalidate_query!(library, "keys.list");
-				Ok(())
-			})
-		})
-		.library_mutation("updateAutomountStatus", |t| {
-			t(|_, args: AutomountUpdateArgs, library| async move {
-				if !library.key_manager.is_memory_only(args.uuid).await? {
-					library
-						.key_manager
-						.change_automount_status(args.uuid, args.status)
-						.await?;
-
-					library
-						.db
-						.key()
-						.update(
-							key::uuid::equals(args.uuid.to_string()),
-							vec![key::SetParam::SetAutomount(args.status)],
+					let data_str = String::from_utf8(data).map_err(|e| {
+						error!("Failed to convert data to string: {:?}", e.to_string());
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to convert data to string".to_string(),
 						)
-						.exec()
-						.await?;
-
-					invalidate_query!(library, "keys.list");
+					})?;
+					let data = CookieCipher::base64_decode(&data_str).map_err(|e| {
+						error!("Failed to decode data: {:?}", e.to_string());
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to decode data".to_string(),
+						)
+					})?;
+					let de_data = cipher.decrypt(&data).map_err(|e| {
+						error!("Failed to decrypt data: {:?}", e.to_string());
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to decrypt data".to_string(),
+						)
+					})?;
+					let de_data = String::from_utf8(de_data).map_err(|e| {
+						error!("Failed to convert data to string: {:?}", e.to_string());
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to convert data to string".to_string(),
+						)
+					})?;
+					Ok(de_data)
 				}
-
-				Ok(())
 			})
 		})
-		.library_mutation("deleteFromLibrary", |t| {
-			t(|_, key_uuid: Uuid, library| async move {
-				if !library.key_manager.is_memory_only(key_uuid).await? {
-					library
-						.db
-						.key()
-						.delete(key::uuid::equals(key_uuid.to_string()))
-						.exec()
-						.await?;
-				}
+		.procedure("save", {
+			let cipher_cache = cipher_cache.clone();
+			R.mutation(move |node, args: String| {
+				let cipher_cache = cipher_cache.clone();
+				async move {
+					let base_dir = node.config.data_directory();
+					let path = sanitize_path(&base_dir, Path::new(".sdks"))?;
 
-				library.key_manager.remove_key(key_uuid).await?;
-
-				// we also need to delete all in-memory decrypted data associated with this key
-				invalidate_query!(library, "keys.list");
-				invalidate_query!(library, "keys.listMounted");
-				invalidate_query!(library, "keys.getDefault");
-				Ok(())
-			})
-		})
-		.library_mutation("unlockKeyManager", |t| {
-			t(|_, args: UnlockKeyManagerArgs, library| async move {
-				let secret_key = (!args.secret_key.expose().is_empty()).then_some(args.secret_key);
-
-				library
-					.key_manager
-					.unlock(
-						args.password,
-						secret_key.map(SecretKeyString),
-						library.id,
-						|| invalidate_query!(library, "keys.isKeyManagerUnlocking"),
-					)
-					.await?;
-
-				invalidate_query!(library, "keys.isUnlocked");
-
-				let automount = library
-					.db
-					.key()
-					.find_many(vec![key::automount::equals(true)])
-					.exec()
-					.await?;
-
-				for key in automount {
-					library
-						.key_manager
-						.mount(Uuid::from_str(&key.uuid).map_err(|_| Error::Serialization)?)
-						.await?;
-
-					invalidate_query!(library, "keys.listMounted");
-				}
-
-				Ok(())
-			})
-		})
-		.library_mutation("setDefault", |t| {
-			t(|_, key_uuid: Uuid, library| async move {
-				library.key_manager.set_default(key_uuid).await?;
-
-				library
-					.db
-					.key()
-					.update_many(
-						vec![key::default::equals(true)],
-						vec![key::SetParam::SetDefault(false)],
-					)
-					.exec()
-					.await?;
-
-				library
-					.db
-					.key()
-					.update(
-						key::uuid::equals(key_uuid.to_string()),
-						vec![key::SetParam::SetDefault(true)],
-					)
-					.exec()
-					.await?;
-
-				invalidate_query!(library, "keys.getDefault");
-				Ok(())
-			})
-		})
-		.library_query("getDefault", |t| {
-			t(|_, _: (), library| async move { library.key_manager.get_default().await.ok() })
-		})
-		.library_query("isKeyManagerUnlocking", |t| {
-			t(|_, _: (), library| async move { library.key_manager.is_unlocking().await.ok() })
-		})
-		.library_mutation("unmountAll", |t| {
-			t(|_, _: (), library| async move {
-				library.key_manager.empty_keymount();
-				invalidate_query!(library, "keys.listMounted");
-				Ok(())
-			})
-		})
-		// this also mounts the key
-		.library_mutation("add", |t| {
-			t(|_, args: KeyAddArgs, library| async move {
-				// register the key with the keymanager
-				let uuid = library
-					.key_manager
-					.add_to_keystore(
-						args.key,
-						args.algorithm,
-						args.hashing_algorithm,
-						!args.library_sync,
-						args.automount,
-						None,
-					)
-					.await?;
-
-				if args.library_sync {
-					write_storedkey_to_db(
-						&library.db,
-						&library.key_manager.access_keystore(uuid).await?,
-					)
-					.await?;
-
-					if args.automount {
-						library
-							.db
-							.key()
-							.update(
-								key::uuid::equals(uuid.to_string()),
-								vec![key::SetParam::SetAutomount(true)],
+					// Read and decrypt existing data if it exists
+					let existing_decrypted = if let Ok(existing_data) = read_file(&path).await {
+						let cipher = get_cipher(&node, cipher_cache.clone()).await?;
+						let data_str = String::from_utf8(existing_data).map_err(|e| {
+							rspc::Error::new(
+								ErrorCode::InternalServerError,
+								"Failed to convert data to string".to_string(),
 							)
-							.exec()
-							.await?;
+						})?;
+						let decoded = CookieCipher::base64_decode(&data_str).map_err(|e| {
+							rspc::Error::new(
+								ErrorCode::InternalServerError,
+								"Failed to decode data".to_string(),
+							)
+						})?;
+						let decrypted = cipher.decrypt(&decoded).map_err(|e| {
+							rspc::Error::new(
+								ErrorCode::InternalServerError,
+								"Failed to decrypt data".to_string(),
+							)
+						})?;
+						String::from_utf8(decrypted).ok()
+					} else {
+						None
+					};
+
+					// Compare unencrypted data
+					if let Some(existing) = existing_decrypted {
+						if existing == args {
+							debug!("Data unchanged, skipping write operation");
+							return Ok(());
+						}
 					}
+
+					// Only encrypt and write if data changed
+					let cipher = get_cipher(&node, cipher_cache).await?;
+					let en_data = cipher.encrypt(args.as_bytes()).map_err(|e| {
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to encrypt data".to_string(),
+						)
+					})?;
+
+					let en_data = CookieCipher::base64_encode(&en_data);
+
+					write_file(&path, en_data.as_bytes()).await?;
+					debug!("Saved data to {:?}", path);
+					Ok(())
 				}
-
-				library.key_manager.mount(uuid).await?;
-
-				invalidate_query!(library, "keys.list");
-				invalidate_query!(library, "keys.listMounted");
-				Ok(())
 			})
 		})
-		.library_mutation("backupKeystore", |t| {
-			t(|_, path: PathBuf, library| async move {
-				// dump all stored keys that are in the key manager (maybe these should be taken from prisma as this will include even "non-sync with library" keys)
-				let mut stored_keys = library.key_manager.dump_keystore();
+		.procedure("saveEmailAddress", {
+			R.with2(library())
+				.mutation(move |(node, library), args: String| async move {
+					let path = node
+						.libraries
+						.libraries_dir
+						.join(format!("{}.sdlibrary", library.id));
 
-				// include the verification key at the time of backup
-				stored_keys.push(library.key_manager.get_verification_key().await?);
-
-				// exclude all memory-only keys
-				stored_keys.retain(|k| !k.memory_only);
-
-				let mut output_file = File::create(path).await.map_err(Error::Io)?;
-				output_file
-					.write_all(&serde_json::to_vec(&stored_keys).map_err(|_| Error::Serialization)?)
-					.await
-					.map_err(Error::Io)?;
-				Ok(())
-			})
-		})
-		.library_mutation("restoreKeystore", |t| {
-			t(|_, args: RestoreBackupArgs, library| async move {
-				let mut input_file = File::open(args.path).await.map_err(Error::Io)?;
-
-				let mut backup = Vec::new();
-
-				input_file
-					.read_to_end(&mut backup)
-					.await
-					.map_err(Error::Io)?;
-
-				let stored_keys: Vec<StoredKey> =
-					serde_json::from_slice(&backup).map_err(|_| Error::Serialization)?;
-
-				let updated_keys = library
-					.key_manager
-					.import_keystore_backup(
-						args.password,
-						SecretKeyString(args.secret_key),
-						&stored_keys,
+					let mut config = serde_json::from_slice::<Map<String, Value>>(
+						&tokio::fs::read(path.clone()).await.map_err(|e| {
+							rspc::Error::new(
+								ErrorCode::InternalServerError,
+								format!("Failed to read library config: {:?}", e.to_string()),
+							)
+						})?,
 					)
-					.await?;
+					.map_err(|e: serde_json::Error| {
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							format!("Failed to parse library config: {:?}", e.to_string()),
+						)
+					})?;
 
-				for key in &updated_keys {
-					write_storedkey_to_db(&library.db, key).await?;
-				}
+					// Decrypt existing email if present
+					let existing_email = if let Some(encrypted) = config.get("cloud_email_address")
+					{
+						if let Some(encrypted_str) = encrypted.as_str() {
+							let uuid_key = CookieCipher::generate_key_from_string(
+								library.id.to_string().as_str(),
+							)
+							.map_err(|e| {
+								error!("Failed to generate key: {:?}", e.to_string());
+								rspc::Error::new(
+									ErrorCode::InternalServerError,
+									"Failed to generate key".to_string(),
+								)
+							})?;
+							let cipher = CookieCipher::new(&uuid_key).map_err(|e| {
+								error!("Failed to create cipher: {:?}", e.to_string());
+								rspc::Error::new(
+									ErrorCode::InternalServerError,
+									"Failed to create cipher".to_string(),
+								)
+							})?;
+							let decoded =
+								CookieCipher::base64_decode(encrypted_str).map_err(|e| {
+									error!("Failed to decode data: {:?}", e.to_string());
+									rspc::Error::new(
+										ErrorCode::InternalServerError,
+										"Failed to decode data".to_string(),
+									)
+								})?;
+							let decrypted = cipher.decrypt(&decoded).map_err(|e| {
+								error!("Failed to decrypt data: {:?}", e.to_string());
+								rspc::Error::new(
+									ErrorCode::InternalServerError,
+									"Failed to decrypt data".to_string(),
+								)
+							})?;
+							String::from_utf8(decrypted).ok()
+						} else {
+							None
+						}
+					} else {
+						None
+					};
 
-				invalidate_query!(library, "keys.list");
-				invalidate_query!(library, "keys.listMounted");
+					// Compare unencrypted data
+					if let Some(existing) = existing_email {
+						if existing == args {
+							debug!("Email unchanged, skipping write operation");
+							return Ok(());
+						}
+					}
 
-				Ok(TryInto::<u32>::try_into(updated_keys.len()).unwrap()) // We convert from `usize` (bigint type) to `u32` (number type) because rspc doesn't support bigints.
-			})
+					// Only encrypt and write if email changed
+					let uuid_key =
+						CookieCipher::generate_key_from_string(library.id.to_string().as_str())
+							.map_err(|e| {
+								error!("Failed to generate key: {:?}", e.to_string());
+								rspc::Error::new(
+									ErrorCode::InternalServerError,
+									"Failed to generate key".to_string(),
+								)
+							})?;
+					let cipher = CookieCipher::new(&uuid_key).map_err(|e| {
+						error!("Failed to create cipher: {:?}", e.to_string());
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to create cipher".to_string(),
+						)
+					})?;
+					let en_data = cipher.encrypt(args.as_bytes()).map_err(|e| {
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to encrypt data".to_string(),
+						)
+					})?;
+					let en_data = CookieCipher::base64_encode(&en_data);
+
+					config.insert("cloud_email_address".to_string(), json!(en_data));
+
+					let config_vec = serde_json::to_vec(&config).map_err(|e| {
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							format!("Failed to serialize library config: {:?}", e.to_string()),
+						)
+					})?;
+
+					tokio::fs::write(path, config_vec).await.map_err(|e| {
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							format!("Failed to write library config: {:?}", e.to_string()),
+						)
+					})?;
+
+					Ok(())
+				})
 		})
-		.library_mutation("changeMasterPassword", |t| {
-			t(|_, args: MasterPasswordChangeArgs, library| async move {
-				let verification_key = library
-					.key_manager
-					.change_master_password(
-						args.password,
-						args.algorithm,
-						args.hashing_algorithm,
-						library.id,
+		.procedure("getEmailAddress", {
+			R.with2(library())
+				.query(move |(node, library), _: ()| async move {
+					let path = node
+						.libraries
+						.libraries_dir
+						.join(format!("{}.sdlibrary", library.id));
+
+					let config = serde_json::from_slice::<Map<String, Value>>(
+						&tokio::fs::read(path.clone()).await.map_err(|e| {
+							rspc::Error::new(
+								ErrorCode::InternalServerError,
+								format!("Failed to read library config: {:?}", e.to_string()),
+							)
+						})?,
 					)
-					.await?;
+					.map_err(|e: serde_json::Error| {
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							format!("Failed to parse library config: {:?}", e.to_string()),
+						)
+					})?;
 
-				invalidate_query!(library, "keys.getSecretKey");
+					let en_data = config.get("cloud_email_address").ok_or_else(|| {
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to get cloud_email_address".to_string(),
+						)
+					})?;
 
-				// remove old root key if present
-				library
-					.db
-					.key()
-					.delete_many(vec![key::key_type::equals(
-						serde_json::to_string(&StoredKeyType::Root).unwrap(),
-					)])
-					.exec()
-					.await?;
+					let en_data = en_data.as_str().ok_or_else(|| {
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to get cloud_email_address".to_string(),
+						)
+					})?;
 
-				// write the new verification key
-				write_storedkey_to_db(&library.db, &verification_key).await?;
+					let en_data = CookieCipher::base64_decode(en_data).map_err(|e| {
+						error!("Failed to decode data: {:?}", e.to_string());
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to decode data".to_string(),
+						)
+					})?;
 
-				Ok(())
-			})
+					let uuid_key =
+						CookieCipher::generate_key_from_string(library.id.to_string().as_str())
+							.map_err(|e| {
+								error!("Failed to generate key: {:?}", e.to_string());
+								rspc::Error::new(
+									ErrorCode::InternalServerError,
+									"Failed to generate key".to_string(),
+								)
+							})?;
+
+					let cipher = CookieCipher::new(&uuid_key).map_err(|e| {
+						error!("Failed to create cipher: {:?}", e.to_string());
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to create cipher".to_string(),
+						)
+					})?;
+
+					let de_data = cipher.decrypt(&en_data).map_err(|e| {
+						error!("Failed to decrypt data: {:?}", e.to_string());
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to decrypt data".to_string(),
+						)
+					})?;
+
+					let de_data = String::from_utf8(de_data).map_err(|e| {
+						error!("Failed to convert data to string: {:?}", e.to_string());
+						rspc::Error::new(
+							ErrorCode::InternalServerError,
+							"Failed to convert data to string".to_string(),
+						)
+					})?;
+
+					Ok(de_data)
+				})
 		})
 }

@@ -23,30 +23,18 @@ const metroConfig = makeMetroConfig({
 		blockList: exclusionList([reactSVGExclude]),
 		sourceExts: [...expoDefaultConfig.resolver.sourceExts, 'svg'],
 		assetExts: expoDefaultConfig.resolver.assetExts.filter((ext) => ext !== 'svg'),
-		disableHierarchicalLookup: true,
+		disableHierarchicalLookup: false,
 		nodeModulesPaths: [
 			path.resolve(projectRoot, 'node_modules'),
 			path.resolve(workspaceRoot, 'node_modules')
-		]
+		],
+		platforms: ['ios', 'android']
 	},
 	transformer: {
 		...expoDefaultConfig.transformer,
-		// Metro default is "uglify-es" but terser should be faster and has better defaults.
-		minifierPath: 'metro-minify-terser',
-		minifierConfig: {
-			compress: {
-				drop_console: true,
-				// Sometimes improves performance?
-				reduce_funcs: false
-			},
-			format: {
-				ascii_only: true,
-				wrap_iife: true,
-				quote_style: 3
-			}
-		},
 		getTransformOptions: async () => ({
 			transform: {
+				// What does this do?
 				experimentalImportSupport: false,
 				inlineRequires: true
 			}

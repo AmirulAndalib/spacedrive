@@ -1,81 +1,158 @@
-import { useCallback, useEffect, useState } from 'react';
-import { ExplorerData, rspc, useLibraryContext } from '@sd/client';
-import { useExplorerStore } from '~/hooks/useExplorerStore';
-import { Inspector } from '../Explorer/Inspector';
-import ExplorerContextMenu from './ContextMenu';
-import TopBar from './TopBar';
-import { VirtualizedList } from './VirtualizedList';
+import { FolderNotchOpen } from '@phosphor-icons/react';
+import { CSSProperties, useEffect, type PropsWithChildren, type ReactNode } from 'react';
+import {
+	explorerLayout,
+	useExplorerLayoutStore,
+	useLibrarySubscription,
+	useRspcLibraryContext,
+	useSelector
+} from '@sd/client';
+import { useOperatingSystem, useShortcut } from '~/hooks';
+
+import { useTopBarContext } from '../TopBar/Context';
+import { useExplorerContext } from './Context';
+import ContextMenu from './ContextMenu';
+import DismissibleNotice from './DismissibleNotice';
+import { ExplorerPathBar, PATH_BAR_HEIGHT } from './ExplorerPathBar';
+import { Inspector, INSPECTOR_WIDTH } from './Inspector';
+import ExplorerContextMenu from './ParentContextMenu';
+import { getQuickPreviewStore } from './QuickPreview/store';
+import { explorerStore } from './store';
+import { useKeyRevealFinder } from './useKeyRevealFinder';
+import { ExplorerViewProps, View } from './View';
+import { EmptyNotice } from './View/EmptyNotice';
+
+import 'react-slidedown/lib/slidedown.css';
+
+import clsx from 'clsx';
+
+import { ExplorerTagBar, TAG_BAR_HEIGHT } from './ExplorerTagBar';
+import { useExplorerDnd } from './useExplorerDnd';
 
 interface Props {
-	data?: ExplorerData;
+	emptyNotice?: ExplorerViewProps['emptyNotice'];
+	contextMenu?: () => ReactNode;
 }
 
-export default function Explorer(props: Props) {
-	const expStore = useExplorerStore();
-	const { library } = useLibraryContext();
+declare global {
+	interface Window {
+		useDragAndDrop: () => void;
+	}
+}
+/**
+ * This component is used in a few routes and acts as the reference demonstration of how to combine
+ * all the elements of the explorer except for the context, which must be used in the parent component.
+ */
+export default function Explorer(props: PropsWithChildren<Props>) {
+	const explorer = useExplorerContext();
+	const layoutStore = useExplorerLayoutStore();
+	const [showInspector, showTagBar] = useSelector(explorerStore, (s) => [
+		s.showInspector,
+		s.isTagAssignModeActive
+	]);
+	const isWindows = useOperatingSystem() === 'windows';
 
-	const [scrollSegments, setScrollSegments] = useState<{ [key: string]: number }>({});
-	const [separateTopBar, setSeparateTopBar] = useState<boolean>(false);
-
-	useEffect(() => {
-		setSeparateTopBar((oldValue) => {
-			const newValue = Object.values(scrollSegments).some((val) => val >= 5);
-
-			if (newValue !== oldValue) return newValue;
-			return oldValue;
-		});
-	}, [scrollSegments]);
-
-	rspc.useSubscription(['jobs.newThumbnail', { library_id: library!.uuid, arg: null }], {
-		onData: (cas_id) => {
-			expStore.addNewThumbnail(cas_id);
+	const showPathBar = explorer.showPathBar && layoutStore.showPathBar;
+	const rspc = useRspcLibraryContext();
+	// Can we put this somewhere else -_-
+	useLibrarySubscription(['jobs.newThumbnail'], {
+		onData: (thumbKey) => {
+			explorerStore.addNewThumbnail(thumbKey);
+		}
+	});
+	useLibrarySubscription(['jobs.newFilePathIdentified'], {
+		onData: (ids) => {
+			if (ids?.length > 0) {
+				// I had planned to somehow fetch the Object, but its a lot more work than its worth given
+				// id have to fetch the file_path explicitly and patch the query
+				// for now, it seems to work a treat just invalidating the whole query
+				rspc.queryClient.invalidateQueries({ queryKey: ['search.paths'] });
+			}
 		}
 	});
 
-	const onScroll = useCallback((y: number) => {
-		setScrollSegments((old) => {
-			return {
-				...old,
-				mainList: y
-			};
-		});
-	}, []);
+	useShortcut('showPathBar', (e) => {
+		e.stopPropagation();
+		explorerLayout.showPathBar = !layoutStore.showPathBar;
+	});
+
+	useShortcut('showInspector', (e) => {
+		e.stopPropagation();
+		if (getQuickPreviewStore().open) return;
+		explorerStore.showInspector = !explorerStore.showInspector;
+	});
+
+	useShortcut('showHiddenFiles', (e) => {
+		e.stopPropagation();
+		explorer.settingsStore.showHiddenFiles = !explorer.settingsStore.showHiddenFiles;
+	});
+
+	useKeyRevealFinder();
+
+	useExplorerDnd();
+
+	const topBar = useTopBarContext();
 
 	return (
-		<div className="relative">
+		<>
 			<ExplorerContextMenu>
-				<div className="relative flex w-full flex-col">
-					<TopBar showSeparator={separateTopBar} />
+				<div
+					ref={explorer.scrollRef}
+					className="explorer-scroll explorer-inspector-scroll flex flex-1 flex-col overflow-x-hidden"
+					style={
+						{
+							'--scrollbar-width': isWindows ? '10px' : '6px',
+							'--scrollbar-height': isWindows ? '10px' : '6px',
+							'--scrollbar-margin-top': `${topBar.topBarHeight}px`,
+							'--scrollbar-margin-bottom': `${showPathBar ? PATH_BAR_HEIGHT + (showTagBar ? TAG_BAR_HEIGHT : 0) : 0}px`,
+							'paddingTop': topBar.topBarHeight,
+							'paddingRight': showInspector ? INSPECTOR_WIDTH : 0
+						} as CSSProperties
+					}
+				>
+					{explorer.items && explorer.items.length > 0 && <DismissibleNotice />}
 
-					<div className="app-background relative flex max-h-full w-full flex-row">
-						{props.data && (
-							<VirtualizedList
-								data={props.data.items}
-								context={props.data.context}
-								onScroll={onScroll}
-							/>
-						)}
-						{expStore.showInspector && (
-							<div className="flex min-w-[260px] max-w-[260px]">
-								<Inspector
-									onScroll={(e) => {
-										const y = (e.target as HTMLElement).scrollTop;
-
-										setScrollSegments((old) => {
-											return {
-												...old,
-												inspector: y
-											};
-										});
-									}}
-									key={props.data?.items[expStore.selectedRowIndex]?.item.id}
-									data={props.data?.items[expStore.selectedRowIndex]}
+					<View
+						contextMenu={props.contextMenu ? props.contextMenu() : <ContextMenu />}
+						emptyNotice={
+							props.emptyNotice ?? (
+								<EmptyNotice
+									icon={FolderNotchOpen}
+									message="This folder is empty"
 								/>
-							</div>
-						)}
-					</div>
+							)
+						}
+						listViewOptions={{ hideHeaderBorder: true }}
+						scrollPadding={{
+							top: topBar.topBarHeight,
+							bottom: showPathBar
+								? PATH_BAR_HEIGHT + (showTagBar ? TAG_BAR_HEIGHT : 0)
+								: undefined
+						}}
+					/>
 				</div>
 			</ExplorerContextMenu>
-		</div>
+
+			{/* TODO: wrap path bar and tag bar in nice wrapper, ideally animate tag bar in/out directly above path bar */}
+			<div className="absolute inset-x-0 bottom-0 z-50 flex flex-col">
+				{showTagBar && <ExplorerTagBar />}
+				{showPathBar && <ExplorerPathBar />}
+			</div>
+
+			{showInspector && (
+				<Inspector
+					className={clsx(
+						'no-scrollbar absolute top-0 pb-3 pl-3 pr-1.5',
+						isWindows ? 'right-3' : 'right-1.5'
+					)}
+					style={{
+						paddingTop: topBar.topBarHeight + 12,
+						bottom: showPathBar
+							? PATH_BAR_HEIGHT + (showTagBar ? TAG_BAR_HEIGHT : 0)
+							: 0
+					}}
+				/>
+			)}
+		</>
 	);
 }
