@@ -1,19 +1,26 @@
-import { useBridgeQuery, useLibraryContext } from '@sd/client';
+import { useBridgeQuery, useClientContext, useLibraryContext } from '@sd/client';
 import { Button, dialogManager } from '@sd/ui';
+import { useLocale } from '~/hooks';
+
 import { Heading } from '../../Layout';
 import CreateDialog from './CreateDialog';
 import ListItem from './ListItem';
 
 export const Component = () => {
-	const libraries = useBridgeQuery(['library.list']);
+	const librariesQuery = useBridgeQuery(['library.list']);
+	const libraries = librariesQuery.data;
 
 	const { library } = useLibraryContext();
+	const { libraries: librariesCtx } = useClientContext();
+	const librariesCtxData = librariesCtx.data;
+
+	const { t } = useLocale();
 
 	return (
 		<>
 			<Heading
-				title="Libraries"
-				description="The database contains all library data and file metadata."
+				title={t('libraries')}
+				description={t('libraries_description')}
 				rightArea={
 					<div className="flex-row space-x-2">
 						<Button
@@ -23,24 +30,23 @@ export const Component = () => {
 								dialogManager.create((dp) => <CreateDialog {...dp} />);
 							}}
 						>
-							Add Library
+							{t('add_library')}
 						</Button>
 					</div>
 				}
 			/>
-
 			<div className="space-y-2">
-				{libraries.data
+				{libraries
 					?.sort((a, b) => {
 						if (a.uuid === library.uuid) return -1;
 						if (b.uuid === library.uuid) return 1;
 						return 0;
 					})
-					.map((library) => (
+					.map((lib) => (
 						<ListItem
-							current={library.uuid === library.uuid}
-							key={library.uuid}
-							library={library}
+							current={lib.uuid === library.uuid}
+							key={lib.uuid}
+							library={lib}
 						/>
 					))}
 			</div>

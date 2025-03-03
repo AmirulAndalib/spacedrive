@@ -1,201 +1,276 @@
-import { ErrorMessage } from '@hookform/error-message';
-import { RSPCError } from '@rspc/client';
-import { useQueryClient } from '@tanstack/react-query';
-import { useEffect, useState } from 'react';
-import { Controller } from 'react-hook-form';
-import { useLibraryMutation, useLibraryQuery } from '@sd/client';
-import { Dialog, RadixCheckbox, UseDialogProps, useDialog } from '@sd/ui';
-import { Input, useZodForm, z } from '@sd/ui/src/forms';
-import { showAlertDialog } from '~/components/AlertDialog';
-import { Platform, usePlatform } from '~/util/Platform';
+import { useCallback, useEffect, useMemo } from 'react';
+import { Controller, get } from 'react-hook-form';
+import { useDebouncedCallback } from 'use-debounce';
+import {
+	extractInfoRSPCError,
+	UnionToTuple,
+	useLibraryMutation,
+	useLibraryQuery,
+	usePlausibleEvent,
+	useZodForm
+} from '@sd/client';
+import {
+	Dialog,
+	ErrorMessage,
+	Label,
+	RadixCheckbox,
+	toast,
+	useDialog,
+	UseDialogProps,
+	z
+} from '@sd/ui';
+import { explorerStore } from '~/app/$libraryId/Explorer/store';
+import { Accordion, Icon } from '~/components';
+import { useCallbackToWatchForm, useLocale } from '~/hooks';
+import { usePlatform } from '~/util/Platform';
 
-const schema = z.object({ path: z.string(), indexer_rules_ids: z.array(z.number()) });
-
-interface Props extends UseDialogProps {
-	path: string;
-}
+import IndexerRuleEditor from './IndexerRuleEditor';
+import { LocationPathInputField } from './PathInput';
 
 const REMOTE_ERROR_FORM_FIELD = 'root.serverError';
-const REMOTE_ERROR_FORM_MESSAGES = {
+const REMOTE_ERROR_FORM_MESSAGE = {
 	// \u000A is a line break, It works with css white-space: pre-line
+	CREATE: '',
 	ADD_LIBRARY:
 		'Location is already linked to another Library.\u000ADo you want to add it to this Library too?',
 	NEED_RELINK: 'Location already present.\u000ADo you want to relink it?'
 };
 
-type RemoteErrorFormMessage = keyof typeof REMOTE_ERROR_FORM_MESSAGES;
+type RemoteErrorFormMessage = keyof typeof REMOTE_ERROR_FORM_MESSAGE;
 
 const isRemoteErrorFormMessage = (message: unknown): message is RemoteErrorFormMessage =>
-	typeof message === 'string' && Object.hasOwnProperty.call(REMOTE_ERROR_FORM_MESSAGES, message);
+	typeof message === 'string' && Object.hasOwnProperty.call(REMOTE_ERROR_FORM_MESSAGE, message);
 
-export const openDirectoryPickerDialog = async (platform: Platform): Promise<null | string> => {
-	if (!platform.openDirectoryPickerDialog) return null;
+const schema = z.object({
+	path: z.string().min(1),
+	method: z.enum(Object.keys(REMOTE_ERROR_FORM_MESSAGE) as UnionToTuple<RemoteErrorFormMessage>),
+	indexerRulesIds: z.array(z.number()),
+	shouldRedirect: z.boolean()
+});
 
-	const path = await platform.openDirectoryPickerDialog();
-	if (!path) return '';
-	if (typeof path !== 'string')
-		// TODO: Should adding multiple locations simultaneously be implemented?
-		throw new Error('Adding multiple locations simultaneously is not supported');
+type SchemaType = z.infer<typeof schema>;
 
-	return path;
-};
+export interface AddLocationDialog extends UseDialogProps {
+	path: string;
+	libraryId: string;
+	method?: RemoteErrorFormMessage;
+}
 
-export const AddLocationDialog = (props: Props) => {
-	const dialog = useDialog(props);
+export const AddLocationDialog = ({
+	path,
+	method = 'CREATE',
+	...dialogProps
+}: AddLocationDialog) => {
 	const platform = usePlatform();
-	const queryClient = useQueryClient();
+	const submitPlausibleEvent = usePlausibleEvent();
+	const listLocations = useLibraryQuery(['locations.list']);
 	const createLocation = useLibraryMutation('locations.create');
 	const relinkLocation = useLibraryMutation('locations.relink');
-	const indexerRulesList = useLibraryQuery(['locations.indexer_rules.list']);
+	const listIndexerRulesQuery = useLibraryQuery(['locations.indexer_rules.list']);
+	const listIndexerRules = listIndexerRulesQuery.data;
 	const addLocationToLibrary = useLibraryMutation('locations.addLibrary');
-	const [remoteError, setRemoteError] = useState<null | RemoteErrorFormMessage>(null);
+
+	// This is required because indexRules is undefined on first render
+	const indexerRulesIds = useMemo(
+		() => listIndexerRules?.filter((rule) => rule.default).map((rule) => rule.id) ?? [],
+		[listIndexerRules]
+	);
 
 	const form = useZodForm({
 		schema,
-		defaultValues: {
-			path: props.path,
-			indexer_rules_ids: []
-		}
+		defaultValues: { path, method, indexerRulesIds, shouldRedirect: true }
 	});
 
 	useEffect(() => {
-		// Clear custom remote error when user performs any change on the form
-		const subscription = form.watch(() => {
-			form.clearErrors(REMOTE_ERROR_FORM_FIELD);
-			setRemoteError(null);
-		});
-		return () => subscription.unsubscribe();
-	}, [form]);
+		// Update form values when default value changes and the user hasn't made any changes
+		if (!form.formState.isDirty)
+			form.reset(
+				{ path, method: form.getValues().method, indexerRulesIds },
+				{ keepErrors: true }
+			);
+	}, [form, path, indexerRulesIds]);
 
-	const onLocationSubmit = form.handleSubmit(async ({ path, indexer_rules_ids }) => {
-		switch (remoteError) {
-			case null:
-				await createLocation.mutateAsync({ path, indexer_rules_ids });
-				break;
-			case 'NEED_RELINK':
-				await relinkLocation.mutateAsync(path);
-				// TODO: Update relinked location with new indexer rules, don't have a way to get location id yet though
-				// await updateLocation.mutateAsync({
-				// 	id: locationId,
-				// 	name: null,
-				// 	hidden: null,
-				// 	indexer_rules_ids,
-				// 	sync_preview_media: null,
-				// 	generate_preview_media: null
-				// });
-				break;
-			case 'ADD_LIBRARY':
-				await addLocationToLibrary.mutateAsync({ path, indexer_rules_ids });
-				break;
-			default:
-				throw new Error('Unimplemented custom remote error handling');
-		}
-	});
+	const addLocation = useCallback(
+		async ({ path, method, indexerRulesIds, shouldRedirect }: SchemaType, dryRun = false) => {
+			let id = null;
 
-	const onLocationSubmitError = async (error: Error) => {
-		if ('cause' in error && error.cause instanceof RSPCError) {
-			// TODO: error.code property is not yet implemented in RSPCError
-			// https://github.com/oscartbeaumont/rspc/blob/60a4fa93187c20bc5cb565cc6ee30b2f0903840e/packages/client/src/interop/error.ts#L59
-			// So we grab it from the shape for now
-			const { code } = error.cause.shape;
-			if (code !== 500) {
-				let { message } = error;
+			switch (method) {
+				case 'CREATE':
+					id = await createLocation.mutateAsync({
+						path,
+						dry_run: dryRun,
+						indexer_rules_ids: indexerRulesIds
+					});
 
-				if (code == 409 && isRemoteErrorFormMessage(message)) {
-					setRemoteError(message);
-					message = REMOTE_ERROR_FORM_MESSAGES[message];
+					submitPlausibleEvent({ event: { type: 'locationCreate' } });
 
-					/**
-					 * TODO: On NEED_RELINK, we should query the backend for
-					 * the current location indexer_rules_ids, then update the checkboxes
-					 * accordingly. However we don't have the location id at this point.
-					 * Maybe backend could return the location id in the error?
-					 */
+					break;
+				case 'NEED_RELINK':
+					if (!dryRun) id = await relinkLocation.mutateAsync(path);
+					// TODO: Update relinked location with new indexer rules, don't have a way to get location id yet though
+					// await updateLocation.mutateAsync({
+					// 	id: locationId,
+					// 	name: null,
+					// 	hidden: null,
+					// 	indexer_rules_ids,
+					// 	sync_preview_media: null,
+					// 	generate_preview_media: null
+					// });
+
+					break;
+				case 'ADD_LIBRARY':
+					id = await addLocationToLibrary.mutateAsync({
+						path,
+						dry_run: dryRun,
+						indexer_rules_ids: indexerRulesIds
+					});
+
+					submitPlausibleEvent({ event: { type: 'locationCreate' } });
+
+					break;
+				default:
+					throw new Error('Unimplemented custom remote error handling');
+			}
+
+			if (shouldRedirect) explorerStore.newLocationToRedirect = id;
+		},
+		[createLocation, relinkLocation, addLocationToLibrary, submitPlausibleEvent]
+	);
+
+	const handleAddError = useCallback(
+		(error: unknown) => {
+			const rspcErrorInfo = extractInfoRSPCError(error);
+			if (!rspcErrorInfo || rspcErrorInfo.code === 500) return false;
+
+			let { message } = rspcErrorInfo;
+			if (rspcErrorInfo.code == 409 && isRemoteErrorFormMessage(message)) {
+				/**
+				 * TODO: On NEED_RELINK, we should query the backend for
+				 * the current location indexer_rules_ids, then update the checkboxes
+				 * accordingly. However we don't have the location id at this point.
+				 * Maybe backend could return the location id in the error?
+				 */
+				if (form.getValues().method !== message) {
+					form.setValue('method', message);
+					message = REMOTE_ERROR_FORM_MESSAGE[message];
+				} else {
+					message = '';
 				}
+			}
 
+			if (message && get(form.formState.errors, REMOTE_ERROR_FORM_FIELD)?.message !== message)
+				form.setError(REMOTE_ERROR_FORM_FIELD, {
+					type: 'remote',
+					message: message.startsWith('location already exists')
+						? 'This location has already been added'
+						: message
+				});
+			return true;
+		},
+		[form]
+	);
+
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	useCallbackToWatchForm(
+		useDebouncedCallback(async (values, { name }) => {
+			if (name === 'path') {
+				// Remote errors should only be cleared when path changes,
+				// as the previous error is used to notify the user of this change
+				form.clearErrors(REMOTE_ERROR_FORM_FIELD);
+
+				// Reset method when path changes
+				if (form.getValues().method !== method) form.setValue('method', method);
+			}
+
+			if (values.path === '') return;
+
+			try {
+				await addLocation(values, true);
+			} catch (error) {
+				handleAddError(error);
+			}
+		}, 200),
+		[form, method, addLocation, handleAddError]
+	);
+
+	const onSubmit = form.handleSubmit(async (values) => {
+		try {
+			await addLocation(values);
+		} catch (error) {
+			if (handleAddError(error)) {
+				// Reset form to remove isSubmitting state
 				form.reset({}, { keepValues: true, keepErrors: true, keepIsValid: true });
-				form.setError(REMOTE_ERROR_FORM_FIELD, { type: 'remote', message: message });
-
 				// Throw error to prevent dialog from closing
 				throw error;
 			}
+
+			toast.error({
+				title: t('failed_to_add_location'),
+				body: t('error_message', { error })
+			});
+
+			return;
 		}
 
-		showAlertDialog({
-			title: 'Error',
-			value: error.message || 'Failed to add location'
-		});
-	};
+		await listLocations.refetch();
+	});
+
+	const { t } = useLocale();
 
 	return (
 		<Dialog
-			{...{ dialog, form }}
-			title="New Location"
-			description={
-				platform.platform === 'web'
-					? 'As you are using the browser version of Spacedrive you will (for now) need to specify an absolute URL of a directory local to the remote node.'
-					: ''
-			}
-			onSubmit={(event) =>
-				onLocationSubmit(event).then(
-					() => queryClient.invalidateQueries(['library.list']),
-					onLocationSubmitError
-				)
-			}
-			ctaLabel="Add"
+			form={form}
+			title={t('new_location')}
+			dialog={useDialog(dialogProps)}
+			icon={<Icon name="NewLocation" size={28} />}
+			onSubmit={onSubmit}
+			closeLabel={t('cancel')}
+			ctaLabel={t('add')}
+			formClassName="w-[375px]"
+			errorMessageException={t('location_is_already_linked')}
+			description={platform.platform === 'web' ? t('new_location_web_description') : ''}
 		>
-			<div className="relative mb-3 flex flex-col">
-				<p className="my-2 text-sm font-bold">Path:</p>
-				<Input
-					type="text"
-					onClick={() =>
-						openDirectoryPickerDialog(platform)
-							.then((path) => path && form.setValue('path', path))
-							.catch((error) => showAlertDialog({ title: 'Error', value: String(error) }))
-					}
-					readOnly={platform.platform !== 'web'}
-					required
-					className="grow cursor-pointer !py-0.5"
-					{...form.register('path')}
-				/>
-			</div>
+			<div className="flex flex-col">
+				<ErrorMessage name={REMOTE_ERROR_FORM_FIELD} variant="large" className="mb-4" />
 
-			<div className="relative flex flex-col">
-				<p className="my-2 text-sm font-bold">File indexing rules:</p>
-				<div className="grid w-full grid-cols-2 gap-4 text-xs font-medium">
+				<p className="mb-1 text-sm font-medium text-ink">{t('path')}</p>
+				<LocationPathInputField className="mb-1.5" {...form.register('path')} />
+
+				<input type="hidden" {...form.register('method')} />
+
+				<Accordion title={t('advanced_settings')}>
 					<Controller
-						name="indexer_rules_ids"
-						control={form.control}
+						name="indexerRulesIds"
 						render={({ field }) => (
-							<>
-								{indexerRulesList.data?.map((rule) => (
-									<RadixCheckbox
-										key={rule.id}
-										label={rule.name}
-										checked={field.value.includes(rule.id)}
-										onCheckedChange={(checked) =>
-											field.onChange(
-												checked && checked !== 'indeterminate'
-													? [...field.value, rule.id]
-													: field.value.filter((fieldValue) => fieldValue !== rule.id)
-											)
-										}
-									/>
-								))}
-							</>
+							<IndexerRuleEditor
+								field={field}
+								label={t('file_indexing_rules')}
+								className="relative flex flex-col"
+								rulesContainerClass="grid grid-cols-2 gap-2"
+								ruleButtonClass="w-full"
+							/>
 						)}
+						control={form.control}
 					/>
+				</Accordion>
+
+				<div className="mt-4 flex items-center gap-1.5">
+					<Controller
+						name="shouldRedirect"
+						render={({ field }) => (
+							<RadixCheckbox
+								checked={field.value}
+								onCheckedChange={field.onChange}
+								className="size-4 text-xs font-semibold"
+							/>
+						)}
+						control={form.control}
+					/>
+					<Label className="text-xs font-semibold">
+						{t('open_new_location_once_added')}
+					</Label>
 				</div>
 			</div>
-
-			<ErrorMessage
-				name={REMOTE_ERROR_FORM_FIELD}
-				render={({ message }) => (
-					<span className="mt-5 inline-block w-full whitespace-pre-wrap text-center text-sm font-semibold text-red-500">
-						{message}
-					</span>
-				)}
-			/>
 		</Dialog>
 	);
 };

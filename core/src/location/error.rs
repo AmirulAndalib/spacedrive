@@ -1,93 +1,115 @@
-use crate::LocationManagerError;
+use sd_core_file_path_helper::FilePathError;
 
-use std::path::PathBuf;
+use sd_prisma::prisma::location;
+use sd_utils::{
+	db::MissingFieldError,
+	error::{FileIOError, NonUtf8PathError},
+};
 
-use rspc::{self, ErrorCode};
+use std::path::Path;
+
+use rspc::ErrorCode;
 use thiserror::Error;
-use tokio::io;
 use uuid::Uuid;
 
-use super::{file_path_helper::FilePathError, metadata::LocationMetadataError};
+use super::{manager::LocationManagerError, metadata::LocationMetadataError};
 
 /// Error type for location related errors
 #[derive(Error, Debug)]
 pub enum LocationError {
 	// Not Found errors
-	#[error("Location not found (path: {0:?})")]
-	PathNotFound(PathBuf),
-	#[error("Location not found (uuid: {0})")]
+	#[error("location not found <path='{}'>", .0.display())]
+	PathNotFound(Box<Path>),
+	#[error("location not found <uuid='{0}'>")]
 	UuidNotFound(Uuid),
-	#[error("Location not found (id: {0})")]
-	IdNotFound(i32),
+	#[error("location not found <id='{0}'>")]
+	IdNotFound(location::id::Type),
 
 	// User errors
-	#[error("Location not a directory (path: {0:?})")]
-	NotDirectory(PathBuf),
-	#[error("Could not find directory in Location (path: {0:?})")]
-	DirectoryNotFound(String),
-	#[error("Library exists in the location metadata file, must relink: (old_path: {old_path:?}, new_path: {new_path:?})")]
+	#[error("location not a directory <path='{}'>", .0.display())]
+	NotDirectory(Box<Path>),
+	#[error("could not find directory in location <path='{}'>", .0.display())]
+	DirectoryNotFound(Box<Path>),
+	#[error(
+		"library exists in the location metadata file, must relink <old_path='{}', new_path='{}'>",
+		.old_path.display(),
+		.new_path.display(),
+	)]
 	NeedRelink {
-		old_path: PathBuf,
-		new_path: PathBuf,
+		old_path: Box<Path>,
+		new_path: Box<Path>,
 	},
 	#[error(
-		"This location belongs to another library, must update .spacedrive file: (path: {0:?})"
+		"this location belongs to another library, must update .spacedrive file <path='{}'>",
+		.0.display()
 	)]
-	AddLibraryToMetadata(PathBuf),
-	#[error("Location metadata file not found: (path: {0:?})")]
-	MetadataNotFound(PathBuf),
-	#[error("Location already exists (path: {0:?})")]
-	LocationAlreadyExists(PathBuf),
+	AddLibraryToMetadata(Box<Path>),
+	#[error("location metadata file not found <path='{}'>", .0.display())]
+	MetadataNotFound(Box<Path>),
+	#[error("location already exists in database <path='{}'>", .0.display())]
+	LocationAlreadyExists(Box<Path>),
+	#[error("nested location currently not supported <path='{}'>", .0.display())]
+	NestedLocation(Box<Path>),
+	#[error(transparent)]
+	NonUtf8Path(#[from] NonUtf8PathError),
 
 	// Internal Errors
-	#[error("Location metadata error (error: {0:?})")]
-	LocationMetadataError(#[from] LocationMetadataError),
-	#[error("Failed to read location path metadata info (path: {1:?}); (error: {0:?})")]
-	LocationPathFilesystemMetadataAccess(io::Error, PathBuf),
-	#[error("Location is read only (at path: {0:?})")]
-	ReadonlyLocationFailure(PathBuf),
-	#[error("Missing metadata file for location (path: {0:?})")]
-	MissingMetadataFile(PathBuf),
-	#[error("Failed to open file from local os (error: {0:?})")]
-	FileReadError(io::Error),
-	#[error("Failed to read mounted volumes from local os (error: {0:?})")]
+	#[error(transparent)]
+	LocationMetadata(#[from] LocationMetadataError),
+	#[error("failed to read location path metadata info: {0}")]
+	LocationPathFilesystemMetadataAccess(FileIOError),
+	#[error("missing metadata file for location <path='{}'>", .0.display())]
+	MissingMetadataFile(Box<Path>),
+	#[error("failed to open file from local OS: {0}")]
+	FileRead(FileIOError),
+	#[error("failed to read mounted volumes from local OS: {0}")]
 	VolumeReadError(String),
-	#[error("Failed to connect to database (error: {0:?})")]
-	IOError(io::Error),
-	#[error("Database error (error: {0:?})")]
-	DatabaseError(#[from] prisma_client_rust::QueryError),
-	#[error("Location manager error (error: {0:?})")]
-	LocationManagerError(#[from] LocationManagerError),
-	#[error("File path related error (error: {0})")]
-	FilePathError(#[from] FilePathError),
+	#[error("database error: {0}")]
+	Database(#[from] prisma_client_rust::QueryError),
+	#[error(transparent)]
+	LocationManager(#[from] LocationManagerError),
+	#[error(transparent)]
+	FilePath(#[from] FilePathError),
+	#[error(transparent)]
+	FileIO(#[from] FileIOError),
+	#[error("location missing path <id='{0}'>")]
+	MissingPath(location::id::Type),
+	#[error("missing-field: {0}")]
+	MissingField(#[from] MissingFieldError),
+	#[error("invalid location scan state value: {0}")]
+	InvalidScanStateValue(i32),
+	#[error(transparent)]
+	Sync(#[from] sd_core_sync::Error),
 }
 
 impl From<LocationError> for rspc::Error {
-	fn from(err: LocationError) -> Self {
-		match err {
+	fn from(e: LocationError) -> Self {
+		use LocationError::*;
+
+		match e {
 			// Not found errors
-			LocationError::PathNotFound(_)
-			| LocationError::UuidNotFound(_)
-			| LocationError::IdNotFound(_) => {
-				rspc::Error::with_cause(ErrorCode::NotFound, err.to_string(), err)
+			PathNotFound(_)
+			| UuidNotFound(_)
+			| IdNotFound(_)
+			| FilePath(FilePathError::IdNotFound(_) | FilePathError::NotFound(_)) => {
+				Self::with_cause(ErrorCode::NotFound, e.to_string(), e)
 			}
 
 			// User's fault errors
-			// | LocationError::MissingLocalPath(_)
-			LocationError::NotDirectory(_) => {
-				rspc::Error::with_cause(ErrorCode::BadRequest, err.to_string(), err)
+			NotDirectory(_) | NestedLocation(_) | LocationAlreadyExists(_) => {
+				Self::with_cause(ErrorCode::BadRequest, e.to_string(), e)
 			}
 
-			// Custom error message is used to differenciate these errors in the frontend
+			// Custom error message is used to differentiate these errors in the frontend
 			// TODO: A better solution would be for rspc to support sending custom data alongside errors
-			LocationError::NeedRelink { .. } => {
-				rspc::Error::with_cause(ErrorCode::Conflict, "NEED_RELINK".to_owned(), err)
-			}
-			LocationError::AddLibraryToMetadata(_) => {
-				rspc::Error::with_cause(ErrorCode::Conflict, "ADD_LIBRARY".to_owned(), err)
+			NeedRelink { .. } => Self::with_cause(ErrorCode::Conflict, "NEED_RELINK".to_owned(), e),
+			AddLibraryToMetadata(_) => {
+				Self::with_cause(ErrorCode::Conflict, "ADD_LIBRARY".to_owned(), e)
 			}
 
-			_ => rspc::Error::with_cause(ErrorCode::InternalServerError, err.to_string(), err),
+			// Internal errors
+			MissingField(missing_error) => missing_error.into(),
+			_ => Self::with_cause(ErrorCode::InternalServerError, e.to_string(), e),
 		}
 	}
 }

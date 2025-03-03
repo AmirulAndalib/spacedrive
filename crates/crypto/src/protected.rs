@@ -28,44 +28,38 @@
 //! let value = protected_data.expose();
 //! ```
 //!
-use std::{fmt::Debug, mem::swap};
-use zeroize::Zeroize;
-#[derive(Clone)]
-pub struct Protected<T>
+
+use std::{fmt::Debug, mem};
+
+use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Protected<T>(T)
 where
-	T: Zeroize,
-{
-	data: T,
-}
+	T: Zeroize;
 
 impl<T> Protected<T>
 where
 	T: Zeroize,
 {
 	pub const fn new(value: T) -> Self {
-		Self { data: value }
+		Self(value)
 	}
 
 	pub const fn expose(&self) -> &T {
-		&self.data
+		&self.0
 	}
 
 	pub fn zeroize(mut self) {
-		self.data.zeroize();
+		self.0.zeroize();
 	}
 }
 
-impl From<Vec<u8>> for Protected<Vec<u8>> {
-	fn from(value: Vec<u8>) -> Self {
-		Self { data: value }
-	}
-}
-
-impl From<Protected<String>> for Protected<Vec<u8>> {
-	fn from(value: Protected<String>) -> Self {
-		Self {
-			data: value.expose().as_bytes().to_vec(),
-		}
+impl<T: Zeroize> From<T> for Protected<T> {
+	fn from(value: T) -> Self {
+		Self(value)
 	}
 }
 
@@ -75,17 +69,8 @@ where
 {
 	pub fn into_inner(mut self) -> T {
 		let mut out = Default::default();
-		swap(&mut self.data, &mut out);
+		mem::swap(&mut self.0, &mut out);
 		out
-	}
-}
-
-impl<T> Drop for Protected<T>
-where
-	T: Zeroize,
-{
-	fn drop(&mut self) {
-		self.data.zeroize();
 	}
 }
 
@@ -95,43 +80,5 @@ where
 {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.write_str("[REDACTED]")
-	}
-}
-
-#[cfg(feature = "serde")]
-impl<'de, T> serde::Deserialize<'de> for Protected<T>
-where
-	T: serde::Deserialize<'de> + Zeroize,
-{
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		Ok(Self::new(T::deserialize(deserializer)?))
-	}
-}
-
-#[cfg(feature = "rspc")]
-use rspc::internal::specta;
-
-#[cfg(feature = "rspc")]
-impl<T> specta::Type for Protected<T>
-where
-	T: specta::Type + Zeroize,
-{
-	const NAME: &'static str = T::NAME;
-	const SID: specta::TypeSid = specta::sid!();
-	const IMPL_LOCATION: specta::ImplLocation = specta::impl_location!();
-
-	fn inline(opts: specta::DefOpts, generics: &[specta::DataType]) -> specta::DataType {
-		T::inline(opts, generics)
-	}
-
-	fn reference(opts: specta::DefOpts, generics: &[specta::DataType]) -> specta::DataType {
-		T::reference(opts, generics)
-	}
-
-	fn definition(opts: specta::DefOpts) -> specta::DataTypeExt {
-		T::definition(opts)
 	}
 }

@@ -1,4 +1,4 @@
-use prisma_client_rust_sdk::prelude::*;
+use prisma_client_rust_sdk::prisma::prisma_models::{ast::WithDocumentation, walkers::ModelWalker};
 
 mod parser;
 
@@ -10,17 +10,19 @@ pub enum AttributeFieldValue<'a> {
 
 #[allow(unused)]
 impl AttributeFieldValue<'_> {
-	pub fn as_single(&self) -> Option<&str> {
-		match self {
-			AttributeFieldValue::Single(field) => Some(field),
-			_ => None,
+	pub const fn as_single(&self) -> Option<&str> {
+		if let AttributeFieldValue::Single(field) = self {
+			Some(field)
+		} else {
+			None
 		}
 	}
 
-	pub fn as_list(&self) -> Option<&Vec<&str>> {
-		match self {
-			AttributeFieldValue::List(fields) => Some(fields),
-			_ => None,
+	pub const fn as_list(&self) -> Option<&Vec<&str>> {
+		if let AttributeFieldValue::List(fields) = self {
+			Some(fields)
+		} else {
+			None
 		}
 	}
 }
@@ -36,14 +38,17 @@ impl<'a> Attribute<'a> {
 		parser::parse(input).map(|(_, a)| a).map_err(|_| ())
 	}
 
-	pub fn field(&self, name: &str) -> Option<&AttributeFieldValue> {
-		self.fields.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
+	pub fn field(&self, name: &str) -> Option<&AttributeFieldValue<'_>> {
+		self.fields
+			.iter()
+			.find_map(|(n, v)| (*n == name).then_some(v))
 	}
 }
 
-pub fn model_attributes(model: &dml::Model) -> Vec<Attribute> {
+pub fn model_attributes(model: ModelWalker<'_>) -> Vec<Attribute<'_>> {
 	model
-		.documentation
+		.ast_model()
+		.documentation()
 		.as_ref()
 		.map(|docs| docs.lines().flat_map(Attribute::parse).collect())
 		.unwrap_or_default()

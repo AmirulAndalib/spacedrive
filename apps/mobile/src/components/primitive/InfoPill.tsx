@@ -1,22 +1,24 @@
-import React from 'react';
+import { IconProps } from 'phosphor-react-native';
+import React, { ReactElement } from 'react';
 import { Text, TextStyle, View, ViewStyle } from 'react-native';
-import { tw, twStyle } from '~/lib/tailwind';
+import { twStyle } from '~/lib/tailwind';
 
 type Props = {
 	text: string;
 	containerStyle?: ViewStyle;
 	textStyle?: TextStyle;
+	icon?: ReactElement<IconProps, any>;
 };
 
 export const InfoPill = (props: Props) => {
 	return (
 		<View
 			style={twStyle(
-				'shadow-app-shade/5 bg-app-highlight rounded-md border border-transparent px-[6px] py-[1px] shadow',
+				'rounded-md border border-transparent bg-app-highlight px-[6px] py-px',
 				props.containerStyle
 			)}
 		>
-			<Text style={twStyle('text-ink-dull text-xs font-medium', props.textStyle)}>
+			<Text style={twStyle('text-xs font-medium text-ink-dull', props.textStyle)}>
 				{props.text}
 			</Text>
 		</View>
@@ -27,11 +29,12 @@ export function PlaceholderPill(props: Props) {
 	return (
 		<View
 			style={twStyle(
-				'shadow-app-shade/10 border-app-highlight rounded-md border border-dashed bg-transparent px-[6px] py-[1px] shadow',
+				'flex-row items-center gap-0.5 rounded-md border border-dashed border-app-lightborder bg-transparent px-[6px] py-px',
 				props.containerStyle
 			)}
 		>
-			<Text style={twStyle('text-ink-faint/70 text-xs font-medium', props.textStyle)}>
+			{props.icon && props.icon}
+			<Text style={twStyle('text-xs font-medium text-ink-faint', props.textStyle)}>
 				{props.text}
 			</Text>
 		</View>

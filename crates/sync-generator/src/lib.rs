@@ -1,8 +1,44 @@
+#![warn(
+	clippy::all,
+	clippy::pedantic,
+	clippy::correctness,
+	clippy::perf,
+	clippy::style,
+	clippy::suspicious,
+	clippy::complexity,
+	clippy::nursery,
+	clippy::unwrap_used,
+	unused_qualifications,
+	rust_2018_idioms,
+	trivial_casts,
+	trivial_numeric_casts,
+	unused_allocation,
+	clippy::unnecessary_cast,
+	clippy::cast_lossless,
+	clippy::cast_possible_truncation,
+	clippy::cast_possible_wrap,
+	clippy::cast_precision_loss,
+	clippy::cast_sign_loss,
+	clippy::dbg_macro,
+	clippy::deprecated_cfg_attr,
+	clippy::separated_literal_suffix,
+	deprecated
+)]
+#![forbid(deprecated_in_future)]
+#![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
+
+use prisma_client_rust_sdk::{
+	prelude::*,
+	prisma::prisma_models::walkers::{
+		FieldWalker, ModelWalker, RefinedFieldWalker, RelationFieldWalker,
+	},
+};
+
 mod attribute;
+mod model;
+mod sync_data;
 
-use attribute::*;
-
-use prisma_client_rust_sdk::prelude::*;
+use attribute::{model_attributes, Attribute, AttributeFieldValue};
 
 #[derive(Debug, serde::Serialize, thiserror::Error)]
 enum Error {}
@@ -10,62 +46,91 @@ enum Error {}
 #[derive(serde::Deserialize)]
 struct SDSyncGenerator {}
 
-type FieldVec<'a> = Vec<&'a dml::Field>;
-
-#[derive(Debug)]
-#[allow(unused)]
-enum ModelSyncType<'a> {
+#[derive(Clone)]
+pub enum ModelSyncType<'a> {
 	Local {
-		id: FieldVec<'a>,
+		id: FieldWalker<'a>,
 	},
-	Owned {
-		id: FieldVec<'a>,
-	},
+	// Owned {
+	// 	id: FieldVec<'a>,
+	// },
 	Shared {
-		id: FieldVec<'a>,
+		id: FieldWalker<'a>,
+		// model ids help reduce storage cost of sync messages
+		model_id: u16,
 	},
 	Relation {
-		group: FieldVec<'a>,
-		item: FieldVec<'a>,
+		group: RelationFieldWalker<'a>,
+		item: RelationFieldWalker<'a>,
+		model_id: u16,
 	},
 }
 
 impl<'a> ModelSyncType<'a> {
-	fn from_attribute(attr: Attribute, model: &'a dml::Model) -> Option<Self> {
-		let id = attr
-			.field("id")
-			.map(|field| match field {
-				AttributeFieldValue::Single(s) => vec![*s],
-				AttributeFieldValue::List(l) => l.clone(),
-			})
-			.unwrap_or_else(|| {
-				model
-					.primary_key
-					.as_ref()
-					.unwrap()
-					.fields
-					.iter()
-					.map(|f| f.name.as_str())
-					.collect()
-			})
-			.into_iter()
-			.flat_map(|name| model.find_field(name))
-			.collect();
-
+	fn from_attribute(attr: &Attribute<'_>, model: ModelWalker<'a>) -> Option<Self> {
 		Some(match attr.name {
-			"local" => Self::Local { id },
-			"owned" => Self::Owned { id },
-			"shared" => Self::Shared { id },
+			"local" | "shared" => {
+				let id = attr
+					.field("id")
+					.and_then(|field| match field {
+						AttributeFieldValue::Single(s) => Some(s),
+						AttributeFieldValue::List(_) => None,
+					})
+					.and_then(|name| model.fields().find(|f| f.name() == *name))?;
+
+				match attr.name {
+					"local" => Self::Local { id },
+					"shared" => Self::Shared {
+						id,
+						model_id: attr
+							.field("modelId")
+							.and_then(|a| a.as_single())
+							.and_then(|s| s.parse().ok())?,
+					},
+					_ => return None,
+				}
+			}
+			"relation" => {
+				let get_field = |name| {
+					attr.field(name)
+						.and_then(|field| match field {
+							AttributeFieldValue::Single(s) => Some(*s),
+							AttributeFieldValue::List(_) => None,
+						})
+						.and_then(|name| {
+							if let RefinedFieldWalker::Relation(r) = model
+								.fields()
+								.find(|f| f.name() == name)
+								.unwrap_or_else(|| panic!("'{name}' field not found"))
+								.refine()
+							{
+								Some(r)
+							} else {
+								None
+							}
+						})
+						.unwrap_or_else(|| panic!("'{name}' must be a relation field"))
+				};
+
+				Self::Relation {
+					item: get_field("item"),
+					group: get_field("group"),
+					model_id: attr
+						.field("modelId")
+						.and_then(|a| a.as_single())
+						.and_then(|s| s.parse().ok())?,
+				}
+			}
+			// "owned" => Self::Owned { id },
 			_ => return None,
 		})
 	}
 
-	fn sync_id(&self) -> Vec<&dml::Field> {
+	fn sync_id(&self) -> Vec<FieldWalker<'_>> {
 		match self {
-			Self::Owned { id } => id.clone(),
-			Self::Local { id } => id.clone(),
-			Self::Shared { id } => id.clone(),
-			_ => vec![],
+			// Self::Owned { id } => id.clone(),
+			Self::Local { id, .. } | Self::Shared { id, .. } => vec![*id],
+			Self::Relation { group, item, .. } => vec![(*group).into(), (*item).into()],
 		}
 	}
 }
@@ -74,7 +139,7 @@ impl ToTokens for ModelSyncType<'_> {
 	fn to_tokens(&self, tokens: &mut TokenStream) {
 		let variant = match self {
 			Self::Local { .. } => "Local",
-			Self::Owned { .. } => "Owned",
+			// Self::Owned { .. } => "Owned",
 			Self::Shared { .. } => "Shared",
 			Self::Relation { .. } => "Relation",
 		};
@@ -83,237 +148,45 @@ impl ToTokens for ModelSyncType<'_> {
 	}
 }
 
+pub type ModelWithSyncType<'a> = (ModelWalker<'a>, Option<ModelSyncType<'a>>);
+
 impl PrismaGenerator for SDSyncGenerator {
 	const NAME: &'static str = "SD Sync Generator";
 	const DEFAULT_OUTPUT: &'static str = "prisma-sync.rs";
 
 	type Error = Error;
 
-	fn generate(self, args: GenerateArgs) -> Result<String, Self::Error> {
-		let models_with_attributes = args
-			.dml
-			.models()
-			.map(|model| (model, model_attributes(model)));
+	fn generate(self, args: GenerateArgs<'_>) -> Result<Module, Self::Error> {
+		let db = &args.schema.db;
 
-		let models_with_sync_types = models_with_attributes.map(|(model, attributes)| {
-			let sync_type = attributes
-				.into_iter()
-				.find_map(|a| ModelSyncType::from_attribute(a, model));
+		let models_with_sync_types = db
+			.walk_models()
+			.map(|model| (model, model_attributes(model)))
+			.map(|(model, attributes)| {
+				let sync_type = attributes
+					.into_iter()
+					.find_map(|a| ModelSyncType::from_attribute(&a, model));
 
-			(model, sync_type)
-		});
+				(model, sync_type)
+			})
+			.collect::<Vec<_>>();
 
-		let model_modules = models_with_sync_types.clone().map(|(model, sync_type)| {
-			let model_name_snake = snake_ident(&model.name);
+		let model_sync_data = sync_data::enumerate(&models_with_sync_types);
 
-            let sync_id = sync_type.as_ref()
-                .map(|sync_type| {
-                    let fields = sync_type.sync_id();
-                    let fields = fields.iter().flat_map(|field| {
-                        let name_snake = snake_ident(field.name());
-
-                        let typ = match field {
-                            dml::Field::ScalarField(_) => {
-                                field.type_tokens(quote!(self))
-                            },
-                            dml::Field::RelationField(relation)=> {
-                                let relation_model_name_snake = snake_ident(&relation.relation_info.referenced_model);
-                                quote!(super::#relation_model_name_snake::SyncId)
-                            },
-                            _ => return None
-                        };
-
-                        Some(quote!(pub #name_snake: #typ))
-                    });
-
-                    quote! {
-                        #[derive(serde::Serialize, serde::Deserialize)]
-                        pub struct SyncId {
-                            #(#fields),*
-                        }
-
-                        impl sd_sync::SyncId for SyncId {
-                            type ModelTypes = #model_name_snake::Types;
-                        }
-
-                        impl sd_sync::SyncType for #model_name_snake::Types {
-                            type SyncId = SyncId;
-                            type Marker = sd_sync::#sync_type;
-                        }
-                    }
-                });
-
-            let set_param_impl = {
-                let field_matches = model.fields().filter_map(|field| {
-                    let field_name_snake = snake_ident(field.name());
-                    let field_name_snake_str = field_name_snake.to_string();
-
-
-                    match field {
-                        dml::Field::ScalarField(_) => {
-                            Some(quote! {
-                                #field_name_snake_str => #model_name_snake::#field_name_snake::set(::serde_json::from_value(val).unwrap()),
-                            })
-                        },
-                        dml::Field::RelationField(relation_field) => {
-                            let relation_model_name_snake = snake_ident(&relation_field.relation_info.referenced_model);
-
-                            match &relation_field.relation_info.references[..] {
-                                [_] => {
-                                    Some(quote! {
-                                        #field_name_snake_str => {
-                                            let val: std::collections::HashMap<String, ::serde_json::Value> = ::serde_json::from_value(val).unwrap();
-                                            let val = val.into_iter().next().unwrap();
-
-                                            #model_name_snake::#field_name_snake::connect(
-                                                #relation_model_name_snake::UniqueWhereParam::deserialize(&val.0, val.1).unwrap()
-                                            )
-                                        },
-                                    })
-                                },
-                                _ => None
-                            }
-                        },
-                        _ => None
-                    }
-                });
-
-                match field_matches.clone().count() {
-                    0 => quote!(),
-                    _ => quote! {
-                        impl #model_name_snake::SetParam {
-                            pub fn deserialize(field: &str, val: ::serde_json::Value) -> Option<Self> {
-                                Some(match field {
-                                    #(#field_matches)*
-                                    _ => return None
-                                })
-                            }
-                        }
-                    }
-                }
-            };
-
-            let unique_param_impl = {
-                let field_matches = model
-                    .loose_unique_criterias()
-                    .iter()
-                    .flat_map(|criteria| match &criteria.fields[..] {
-                        [field] => {
-                            let unique_field_name_str = &field.name;
-                            let unique_field_name_snake = snake_ident(unique_field_name_str);
-
-                            Some(quote!(#unique_field_name_str =>
-                                #model_name_snake::#unique_field_name_snake::equals(
-                                    ::serde_json::from_value(val).unwrap()
-                                ),
-                            ))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-
-                match field_matches.len() {
-                    0 => quote!(),
-                    _ => quote! {
-                        impl #model_name_snake::UniqueWhereParam {
-                            pub fn deserialize(field: &str, val: ::serde_json::Value) -> Option<Self> {
-                                Some(match field {
-                                    #(#field_matches)*
-                                    _ => return None
-                                })
-                            }
-                        }
-                    },
-                }
-            };
-
-            quote! {
-                pub mod #model_name_snake {
-                    use super::prisma::*;
-
-                    #sync_id
-
-                    #set_param_impl
-
-                    #unique_param_impl
-                }
-            }
-        });
-
-		let model_sync_data = {
-			let (variants, matches): (Vec<_>, Vec<_>) = models_with_sync_types
-				.filter_map(|(model, sync_type)| {
-					let model_name_snake = snake_ident(&model.name);
-					let model_name_pascal = pascal_ident(&model.name);
-					let model_name_str = &model.name;
-
-					sync_type.and_then(|a| {
-						let data_type = match a {
-							ModelSyncType::Owned { .. } => quote!(OwnedOperationData),
-							ModelSyncType::Shared { .. } => quote!(SharedOperationData),
-							ModelSyncType::Relation { .. } => {
-								quote!(RelationOperationData)
-							}
-							_ => return None,
-						};
-
-						let variant = quote! {
-							#model_name_pascal(#model_name_snake::SyncId, sd_sync::#data_type)
-						};
-
-						let op_type_enum = quote!(sd_sync::CRDTOperationType);
-
-						let match_case = match a {
-							ModelSyncType::Owned { .. } => {
-								quote! {
-									#op_type_enum::Owned(op) if op.model == #model_name_str =>
-										Self::#model_name_pascal(serde_json::from_value(op.record_id).ok()?, op.data)
-								}
-							}
-							ModelSyncType::Shared { .. } => {
-								quote! {
-									#op_type_enum::Shared(op) if op.model == #model_name_str =>
-										Self::#model_name_pascal(serde_json::from_value(op.record_id).ok()?, op.data)
-								}
-							}
-							// ModelSyncType::Relation { .. } => {
-							// 	quote! {
-							// 		(#model_name_str, sd_sync::CRDTOperation::Relation(op)) =>
-							// 			Self::#model_name_pascal()
-							// 	}
-							// }
-							_ => return None,
-						};
-
-						Some((variant, match_case))
-					})
-				})
-				.unzip();
-
+		let mut module = Module::new(
+			"root",
 			quote! {
-				pub enum ModelSyncData {
-					#(#variants),*
-				}
+				use crate::prisma;
 
-				impl ModelSyncData {
-					pub fn from_op(op: sd_sync::CRDTOperationType) -> Option<Self> {
-						Some(match op {
-							#(#matches),*,
-							_ => return None
-						})
-					}
-				}
-			}
-		};
+				#model_sync_data
+			},
+		);
+		models_with_sync_types
+			.into_iter()
+			.map(model::module)
+			.for_each(|model| module.add_submodule(model));
 
-		Ok(quote! {
-			use crate::prisma;
-
-			#model_sync_data
-
-			#(#model_modules)*
-		}
-		.to_string())
+		Ok(module)
 	}
 }
 

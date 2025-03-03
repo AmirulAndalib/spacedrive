@@ -1,208 +1,284 @@
-use rspc::{ErrorCode, Type};
-use serde::Deserialize;
+use crate::{invalidate_query, library::Library, object::tag::TagCreateArgs};
 
-use serde_json::json;
-use tracing::info;
-use uuid::Uuid;
-
-use crate::{
-	api::locations::{object_with_file_paths, ExplorerContext, ExplorerData, ExplorerItem},
-	invalidate_query,
-	library::Library,
-	prisma::{object, tag, tag_on_object},
-	sync,
+use sd_prisma::{
+	prisma::{device, file_path, object, tag, tag_on_object},
+	prisma_sync,
 };
+use sd_sync::{option_sync_db_entry, sync_db_entry, sync_entry, OperationFactory};
 
-use super::{utils::LibraryRequest, RouterBuilder};
+use std::collections::BTreeMap;
 
-pub(crate) fn mount() -> RouterBuilder {
-	RouterBuilder::new()
-		.library_query("list", |t| {
-			t(
-				|_, _: (), library| async move { Ok(library.db.tag().find_many(vec![]).exec().await?) },
+use chrono::{DateTime, Utc};
+use itertools::{Either, Itertools};
+use rspc::{alpha::AlphaRouter, ErrorCode};
+use serde::{Deserialize, Serialize};
+use specta::Type;
+
+use super::{utils::library, Ctx, R};
+
+pub(crate) fn mount() -> AlphaRouter<Ctx> {
+	R.router()
+		.procedure("list", {
+			R.with2(library()).query(|(_, library), _: ()| async move {
+				Ok(library.db.tag().find_many(vec![]).exec().await?)
+			})
+		})
+		.procedure("getForObject", {
+			R.with2(library())
+				.query(|(_, library), object_id: i32| async move {
+					Ok(library
+						.db
+						.tag()
+						.find_many(vec![tag::tag_objects::some(vec![
+							tag_on_object::object_id::equals(object_id),
+						])])
+						.exec()
+						.await?)
+				})
+		})
+		.procedure("getWithObjects", {
+			#[derive(Serialize, Type)]
+			pub struct ObjectWithDateCreated {
+				object: object::Data,
+				date_created: DateTime<Utc>,
+			}
+
+			R.with2(library()).query(
+				|(_, library), object_ids: Vec<object::id::Type>| async move {
+					let Library { db, .. } = library.as_ref();
+
+					let tags_with_objects = db
+						.tag()
+						.find_many(vec![tag::tag_objects::some(vec![
+							tag_on_object::object_id::in_vec(object_ids.clone()),
+						])])
+						.select(tag::select!({
+							id
+							tag_objects(vec![tag_on_object::object_id::in_vec(object_ids.clone())]): select {
+								date_created
+								object: select {
+									id
+								}
+							}
+						}))
+						.exec()
+						.await?;
+
+					// This doesn't need normalised caching because it doesn't return whole models.
+					Ok(tags_with_objects
+						.into_iter()
+						.map(|tag| (tag.id, tag.tag_objects))
+						.collect::<BTreeMap<_, _>>())
+				},
 			)
 		})
-		.library_query("getExplorerData", |t| {
-			t(|_, tag_id: i32, library| async move {
-				info!("Getting files for tag {}", tag_id);
+		.procedure("get", {
+			R.with2(library())
+				.query(|(_, library), tag_id: i32| async move {
+					Ok(library
+						.db
+						.tag()
+						.find_unique(tag::id::equals(tag_id))
+						.exec()
+						.await?)
+				})
+		})
+		.procedure("create", {
+			R.with2(library())
+				.mutation(|(_, library), args: TagCreateArgs| async move {
+					// Check if tag with the same name already exists
+					let existing_tag = library
+						.db
+						.tag()
+						.find_many(vec![tag::name::equals(Some(args.name.clone()))])
+						.select(tag::select!({ id }))
+						.exec()
+						.await?;
 
-				let Library { db, .. } = &library;
+					if !existing_tag.is_empty() {
+						return Err(rspc::Error::new(
+							ErrorCode::Conflict,
+							"Tag with the same name already exists".to_string(),
+						));
+					}
 
-				let tag = db
-					.tag()
-					.find_unique(tag::id::equals(tag_id))
-					.exec()
-					.await?
-					.ok_or_else(|| {
-						rspc::Error::new(
-							ErrorCode::NotFound,
-							format!("Tag <id={tag_id}> not found"),
-						)
-					})?;
+					let created_tag = args.exec(&library).await?;
 
-				let objects = db
-					.object()
-					.find_many(vec![object::tags::some(vec![
-						tag_on_object::tag_id::equals(tag_id),
-					])])
-					.include(object_with_file_paths::include())
-					.exec()
-					.await?;
+					invalidate_query!(library, "tags.list");
 
-				let mut items = Vec::with_capacity(objects.len());
+					Ok(created_tag)
+				})
+		})
+		.procedure("assign", {
+			#[derive(Debug, Type, Deserialize)]
+			#[specta(inline)]
+			enum Target {
+				Object(object::id::Type),
+				FilePath(file_path::id::Type),
+			}
 
-				for mut object in objects {
-					// sorry brendan
-					// grab the first path and tac on the name
-					let oldest_path = &object.file_paths[0];
-					object.name = Some(oldest_path.name.clone());
-					object.extension = if oldest_path.extension.is_empty() {
-						None
-					} else {
-						Some(oldest_path.extension.clone())
-					};
-					// a long term fix for this would be to have the indexer give the Object
-					// a name and extension, sacrificing its own and only store newly found Path
-					// names that differ from the Object name
+			#[derive(Debug, Type, Deserialize)]
+			#[specta(inline)]
+			struct TagAssignArgs {
+				targets: Vec<Target>,
+				tag_id: i32,
+				unassign: bool,
+			}
 
-					let cas_id = object
-						.file_paths
-						.iter()
-						.map(|fp| fp.cas_id.as_ref())
-						.find_map(|c| c);
+			R.with2(library())
+				.mutation(|(_, library), args: TagAssignArgs| async move {
+					let Library { db, sync, .. } = library.as_ref();
 
-					let has_thumbnail = if let Some(cas_id) = cas_id {
-						library.thumbnail_exists(cas_id).await.map_err(|e| {
-							rspc::Error::with_cause(
-								ErrorCode::InternalServerError,
-								"Failed to check that thumbnail exists".to_string(),
-								e,
+					let device_id = library
+						.db
+						.device()
+						.find_unique(device::pub_id::equals(sync.device_pub_id.to_db()))
+						.select(device::select!({ id }))
+						.exec()
+						.await?
+						.ok_or_else(|| {
+							rspc::Error::new(
+								ErrorCode::NotFound,
+								"Local device not found".to_string(),
 							)
 						})?
+						.id;
+
+					let tag = db
+						.tag()
+						.find_unique(tag::id::equals(args.tag_id))
+						.select(tag::select!({ pub_id }))
+						.exec()
+						.await?
+						.ok_or_else(|| {
+							rspc::Error::new(ErrorCode::NotFound, "Tag not found".to_string())
+						})?;
+
+					let (objects, file_paths) = db
+						._batch({
+							let (objects, file_paths): (Vec<_>, Vec<_>) = args
+								.targets
+								.into_iter()
+								.partition_map(|target| match target {
+									Target::Object(id) => Either::Left(id),
+									Target::FilePath(id) => Either::Right(id),
+								});
+
+							(
+								db.object()
+									.find_many(vec![object::id::in_vec(objects)])
+									.select(object::select!({
+										id
+										pub_id
+									})),
+								db.file_path()
+									.find_many(vec![file_path::id::in_vec(file_paths)])
+									.select(file_path::select!({
+										id
+										pub_id
+										is_dir
+										object: select { id pub_id }
+									})),
+							)
+						})
+						.await?;
+
+					if args.unassign {
+						let query = db.tag_on_object().delete_many(vec![
+							tag_on_object::tag_id::equals(args.tag_id),
+							tag_on_object::object_id::in_vec(
+								objects
+									.iter()
+									.map(|o| o.id)
+									.chain(
+										file_paths
+											.iter()
+											.filter_map(|fp| fp.object.as_ref().map(|o| o.id)),
+									)
+									.collect(),
+							),
+						]);
+
+						let ops = objects
+							.into_iter()
+							.map(|o| o.pub_id)
+							.chain(
+								file_paths
+									.into_iter()
+									.filter_map(|fp| fp.object.map(|o| o.pub_id)),
+							)
+							.map(|pub_id| {
+								sync.relation_delete(prisma_sync::tag_on_object::SyncId {
+									tag: prisma_sync::tag::SyncId {
+										pub_id: tag.pub_id.clone(),
+									},
+									object: prisma_sync::object::SyncId { pub_id },
+								})
+							})
+							.collect::<Vec<_>>();
+
+						if !ops.is_empty() {
+							sync.write_ops(db, (ops, query)).await?;
+						}
 					} else {
-						false
-					};
+						let (sync_ops, db_creates) = objects
+							.into_iter()
+							.map(|o| (o.id, o.pub_id))
+							.chain(
+								file_paths
+									.into_iter()
+									.filter_map(|fp| fp.object.map(|o| (o.id, o.pub_id))),
+							)
+							.map(|(id, pub_id)| {
+								(
+									sync.relation_create(
+										prisma_sync::tag_on_object::SyncId {
+											tag: prisma_sync::tag::SyncId {
+												pub_id: tag.pub_id.clone(),
+											},
+											object: prisma_sync::object::SyncId { pub_id },
+										},
+										[sync_entry!(
+											prisma_sync::device::SyncId {
+												pub_id: sync.device_pub_id.to_db(),
+											},
+											tag_on_object::device
+										)],
+									),
+									tag_on_object::CreateUnchecked {
+										tag_id: args.tag_id,
+										object_id: id,
+										_params: vec![
+											tag_on_object::date_created::set(Some(
+												Utc::now().into(),
+											)),
+											tag_on_object::device_id::set(Some(device_id)),
+										],
+									},
+								)
+							})
+							.unzip::<_, _, Vec<_>, Vec<_>>();
 
-					items.push(ExplorerItem::Object {
-						has_thumbnail,
-						item: object,
-					});
-				}
+						if !sync_ops.is_empty() && !db_creates.is_empty() {
+							sync.write_ops(
+								db,
+								(
+									sync_ops,
+									db.tag_on_object().create_many(db_creates).skip_duplicates(),
+								),
+							)
+							.await?;
+						}
+					}
 
-				info!("Got objects {}", items.len());
+					invalidate_query!(library, "tags.getForObject");
+					invalidate_query!(library, "tags.getWithObjects");
+					invalidate_query!(library, "search.objects");
 
-				Ok(ExplorerData {
-					context: ExplorerContext::Tag(tag),
-					items,
+					Ok(())
 				})
-			})
 		})
-		.library_query("getForObject", |t| {
-			t(|_, object_id: i32, library| async move {
-				Ok(library
-					.db
-					.tag()
-					.find_many(vec![tag::tag_objects::some(vec![
-						tag_on_object::object_id::equals(object_id),
-					])])
-					.exec()
-					.await?)
-			})
-		})
-		.library_query("get", |t| {
-			t(|_, tag_id: i32, library| async move {
-				Ok(library
-					.db
-					.tag()
-					.find_unique(tag::id::equals(tag_id))
-					.exec()
-					.await?)
-			})
-		})
-		// .library_mutation("create", |t| {
-		// 	#[derive(Type, Deserialize)]
-		// 	pub struct TagCreateArgs {
-		// 		pub name: String,
-		// 		pub color: String,
-		// 	}
-		// 	t(|_, args: TagCreateArgs, library| async move {
-		// 		let created_tag = Tag::new(args.name, args.color);
-		// 		created_tag.save(&library.db).await?;
-		// 		invalidate_query!(library, "tags.list");
-		// 		Ok(created_tag)
-		// 	})
-		// })
-		.library_mutation("create", |t| {
-			#[derive(Type, Deserialize)]
-			pub struct TagCreateArgs {
-				pub name: String,
-				pub color: String,
-			}
-
-			t(|_, args: TagCreateArgs, library| async move {
-				let Library { db, sync, .. } = &library;
-
-				let pub_id = Uuid::new_v4().as_bytes().to_vec();
-
-				let created_tag = sync
-					.write_op(
-						db,
-						sync.unique_shared_create(
-							sync::tag::SyncId {
-								pub_id: pub_id.clone(),
-							},
-							[("name", json!(args.name)), ("color", json!(args.color))],
-						),
-						db.tag().create(
-							pub_id,
-							vec![
-								tag::name::set(Some(args.name)),
-								tag::color::set(Some(args.color)),
-							],
-						),
-					)
-					.await?;
-
-				invalidate_query!(library, "tags.list");
-
-				Ok(created_tag)
-			})
-		})
-		.library_mutation("assign", |t| {
-			#[derive(Debug, Type, Deserialize)]
-			pub struct TagAssignArgs {
-				pub object_id: i32,
-				pub tag_id: i32,
-				pub unassign: bool,
-			}
-
-			t(|_, args: TagAssignArgs, library| async move {
-				if args.unassign {
-					library
-						.db
-						.tag_on_object()
-						.delete(tag_on_object::tag_id_object_id(args.tag_id, args.object_id))
-						.exec()
-						.await?;
-				} else {
-					library
-						.db
-						.tag_on_object()
-						.create(
-							tag::id::equals(args.tag_id),
-							object::id::equals(args.object_id),
-							vec![],
-						)
-						.exec()
-						.await?;
-				}
-
-				invalidate_query!(library, "tags.getForObject");
-
-				Ok(())
-			})
-		})
-		.library_mutation("update", |t| {
+		.procedure("update", {
 			#[derive(Type, Deserialize)]
 			pub struct TagUpdateArgs {
 				pub id: i32,
@@ -210,61 +286,111 @@ pub(crate) fn mount() -> RouterBuilder {
 				pub color: Option<String>,
 			}
 
-			t(|_, args: TagUpdateArgs, library| async move {
-				let Library { sync, db, .. } = &library;
+			R.with2(library()).mutation(
+				|(_, library), TagUpdateArgs { id, name, color }: TagUpdateArgs| async move {
+					if name.is_none() && color.is_none() {
+						return Ok(());
+					}
 
-				let tag = db
-					.tag()
-					.find_unique(tag::id::equals(args.id))
-					.select(tag::select!({ pub_id }))
-					.exec()
-					.await?
-					.unwrap();
+					let Library { sync, db, .. } = library.as_ref();
 
-				sync.write_ops(
-					db,
-					(
-						[
-							args.name.as_ref().map(|v| ("name", json!(v))),
-							args.color.as_ref().map(|v| ("color", json!(v))),
-						]
-						.into_iter()
-						.flatten()
-						.map(|(k, v)| {
-							sync.shared_update(
-								sync::tag::SyncId {
-									pub_id: tag.pub_id.clone(),
-								},
-								k,
-								v,
-							)
-						})
-						.collect(),
-						db.tag().update(
-							tag::id::equals(args.id),
-							vec![tag::name::set(args.name), tag::color::set(args.color)],
+					let tag = db
+						.tag()
+						.find_unique(tag::id::equals(id))
+						.select(tag::select!({ pub_id }))
+						.exec()
+						.await?
+						.ok_or(rspc::Error::new(
+							ErrorCode::NotFound,
+							"Error finding tag in db".into(),
+						))?;
+
+					let (sync_params, db_params) = [
+						option_sync_db_entry!(name, tag::name),
+						option_sync_db_entry!(color, tag::color),
+						Some(sync_db_entry!(Utc::now(), tag::date_modified)),
+					]
+					.into_iter()
+					.flatten()
+					.unzip::<_, _, Vec<_>, Vec<_>>();
+
+					sync.write_op(
+						db,
+						sync.shared_update(
+							prisma_sync::tag::SyncId {
+								pub_id: tag.pub_id.clone(),
+							},
+							sync_params,
 						),
-					),
-				)
-				.await?;
-
-				invalidate_query!(library, "tags.list");
-
-				Ok(())
-			})
-		})
-		.library_mutation("delete", |t| {
-			t(|_, tag_id: i32, library| async move {
-				library
-					.db
-					.tag()
-					.delete(tag::id::equals(tag_id))
-					.exec()
+						db.tag()
+							.update(tag::id::equals(id), db_params)
+							.select(tag::select!({ id })),
+					)
 					.await?;
 
-				invalidate_query!(library, "tags.list");
+					invalidate_query!(library, "tags.list");
 
-				Ok(())
-			})
+					Ok(())
+				},
+			)
 		})
+		.procedure(
+			"delete",
+			R.with2(library())
+				.mutation(|(_, library), tag_id: tag::id::Type| async move {
+					let Library { sync, db, .. } = &*library;
+
+					let tag_pub_id = db
+						.tag()
+						.find_unique(tag::id::equals(tag_id))
+						.select(tag::select!({ pub_id }))
+						.exec()
+						.await?
+						.ok_or(rspc::Error::new(
+							rspc::ErrorCode::NotFound,
+							"Tag not found".to_string(),
+						))?
+						.pub_id;
+
+					let delete_ops = db
+						.tag_on_object()
+						.find_many(vec![tag_on_object::tag_id::equals(tag_id)])
+						.select(tag_on_object::select!({ object: select { pub_id } }))
+						.exec()
+						.await?
+						.into_iter()
+						.map(|tag_on_object| {
+							sync.relation_delete(prisma_sync::tag_on_object::SyncId {
+								tag: prisma_sync::tag::SyncId {
+									pub_id: tag_pub_id.clone(),
+								},
+								object: prisma_sync::object::SyncId {
+									pub_id: tag_on_object.object.pub_id,
+								},
+							})
+						})
+						.collect::<Vec<_>>();
+
+					sync.write_ops(
+						db,
+						(
+							delete_ops,
+							db.tag_on_object()
+								.delete_many(vec![tag_on_object::tag_id::equals(tag_id)]),
+						),
+					)
+					.await?;
+
+					sync.write_op(
+						db,
+						sync.shared_delete(prisma_sync::tag::SyncId { pub_id: tag_pub_id }),
+						db.tag().delete(tag::id::equals(tag_id)),
+					)
+					.await?;
+
+					invalidate_query!(library, "tags.list");
+
+					Ok(())
+				}),
+		)
 }

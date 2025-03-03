@@ -1,65 +1,87 @@
 import { BloomOne } from '@sd/assets/images';
 import clsx from 'clsx';
-import { useEffect } from 'react';
-import { Outlet, useNavigate } from 'react-router';
-import { getOnboardingStore, useDebugState } from '@sd/client';
-import { tw } from '@sd/ui';
+import { Navigate, Outlet } from 'react-router';
+import { useDebugState } from '@sd/client';
 import DragRegion from '~/components/DragRegion';
 import { useOperatingSystem } from '~/hooks/useOperatingSystem';
+
 import DebugPopover from '../$libraryId/Layout/Sidebar/DebugPopover';
+import { macOnly } from '../$libraryId/Layout/Sidebar/helpers';
+import { OnboardingContext, useContextValue } from './context';
 import Progress from './Progress';
 
-export const OnboardingContainer = tw.div`flex flex-col items-center`;
-export const OnboardingTitle = tw.h2`mb-2 text-3xl font-bold`;
-export const OnboardingDescription = tw.p`max-w-xl text-center text-ink-dull`;
-export const OnboardingImg = tw.img`w-20 h-20 mb-2`;
-
 export const Component = () => {
-	const os = useOperatingSystem();
+	const os = useOperatingSystem(false);
 	const debugState = useDebugState();
-	const navigate = useNavigate();
+	// FIX-ME: Intro video breaks onboarding for the web and Linux versions
+	// const [showIntro, setShowIntro] = useState(os === 'macOS' || os === 'windows');
+	// const windowSize = useWindowSize();
 
-	useEffect(
-		() => {
-			const obStore = getOnboardingStore();
+	const ctx = useContextValue();
 
-			// This is neat because restores the last active screen, but only if it is not the starting screen
-			// Ignoring if people navigate back to the start if progress has been made
-			if (obStore.unlockedScreens.length > 1) {
-				navigate(`/onboarding/${obStore.lastActiveScreen}`);
-			}
-		},
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-		[]
-	);
+	if (ctx.libraries.isLoading) return null;
+	if (ctx.library?.uuid !== undefined) return <Navigate to={`/${ctx.library.uuid}`} replace />;
 
 	return (
-		<div
-			className={clsx(
-				macOnly(os, 'bg-opacity-[0.75]'),
-				'bg-sidebar text-ink flex h-screen flex-col'
-			)}
-		>
-			<DragRegion className="z-50 h-9" />
-			<div className="-mt-5 flex grow flex-col p-10">
-				<div className="flex grow flex-col items-center justify-center">
-					<Outlet />
+		<OnboardingContext.Provider value={ctx}>
+			<div
+				className={clsx(
+					macOnly(os, 'bg-opacity-[0.75]'),
+					'flex h-screen flex-col bg-sidebar text-ink'
+				)}
+			>
+				{/* <AnimatePresence>
+					{showIntro && (
+						<motion.div
+							initial={{ opacity: 1 }}
+							animate={{ opacity: 1 }}
+							transition={{ duration: 0.5 }}
+							exit={{ opacity: 0 }}
+							className="absolute top-0 left-0 z-50 flex items-center justify-center w-screen h-screen"
+						>
+							<svg
+								width="100%"
+								height="100%"
+								className="absolute left-0 top-0 z-[-1]"
+								viewBox={`0 0 ${windowSize.width} ${windowSize.height}`}
+								fill="none"
+								xmlns="http://www.w3.org/2000/svg"
+							>
+								<rect width="100%" height="100%" fill="#13151A" />
+							</svg>
+							<video
+								className="relative z-10 mx-auto brightness-100"
+								autoPlay
+								onEnded={() => {
+									setShowIntro(false);
+								}}
+								muted
+								controls={false}
+								src={SdIntro}
+							/>
+						</motion.div>
+					)}
+				</AnimatePresence> */}
+				<DragRegion className="z-50 h-9" />
+				<div className="-mt-5 flex grow flex-col gap-8 p-10">
+					<div className="flex grow flex-col items-center justify-center">
+						<Outlet />
+					</div>
+					<Progress />
 				</div>
-				<Progress />
-			</div>
-			<div className="flex justify-center p-4">
-				<p className="text-ink-dull text-xs opacity-50">&copy; 2022 Spacedrive Technology Inc.</p>
-			</div>
-			<div className="absolute -z-10">
-				<div className="relative h-screen w-screen">
-					<img src={BloomOne} className="absolute h-[2000px] w-[2000px]" />
-					{/* <img src={BloomThree} className="absolute w-[2000px] h-[2000px] -right-[200px]" /> */}
+				<div className="flex justify-center p-4">
+					<p className="text-xs text-ink-dull opacity-50">
+						&copy; {new Date().getFullYear()} Spacedrive Technology Inc.
+					</p>
 				</div>
+				<div className="absolute -z-10">
+					<div className="relative h-screen w-screen">
+						<img src={BloomOne} className="absolute size-[2000px]" />
+						{/* <img src={BloomThree} className="absolute w-[2000px] h-[2000px] -right-[200px]" /> */}
+					</div>
+				</div>
+				{debugState.enabled && <DebugPopover />}
 			</div>
-			{debugState.enabled && <DebugPopover />}
-		</div>
+		</OnboardingContext.Provider>
 	);
 };
-
-const macOnly = (platform: string | undefined, classnames: string) =>
-	platform === 'macOS' ? classnames : '';

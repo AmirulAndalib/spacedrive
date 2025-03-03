@@ -1,4 +1,4 @@
-import { useQueryClient } from '@tanstack/react-query';
+import * as Haptics from 'expo-haptics';
 import { Heart } from 'phosphor-react-native';
 import { useState } from 'react';
 import { Pressable, PressableProps } from 'react-native';
@@ -10,21 +10,19 @@ type Props = {
 };
 
 const FavoriteButton = (props: Props) => {
-	const queryClient = useQueryClient();
 	const [favorite, setFavorite] = useState(props.data.favorite);
 
-	const { mutate: toggleFavorite, isLoading } = useLibraryMutation('files.setFavorite', {
+	const { mutate: toggleFavorite, isPending } = useLibraryMutation('files.setFavorite', {
 		onSuccess: () => {
-			// TODO: Not sure why rust isn't invalidating these...
-			queryClient.invalidateQueries(['locations.getExplorerData']);
-			queryClient.invalidateQueries(['tags.getExplorerData']);
+			// TODO: Invalidate search queries
 			setFavorite(!favorite);
+			Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 		}
 	});
 
 	return (
 		<Pressable
-			disabled={isLoading}
+			disabled={isPending}
 			onPress={() => toggleFavorite({ id: props.data.id, favorite: !favorite })}
 			style={props.style}
 		>

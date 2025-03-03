@@ -1,51 +1,61 @@
-import { useCallback, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { useDebouncedCallback } from 'use-debounce';
+import { useSnapshot } from 'valtio';
 import { Object as SDObject, useLibraryMutation } from '@sd/client';
 import { Divider, TextArea } from '@sd/ui';
+import { useLocale } from '~/hooks';
+
 import { MetaContainer, MetaTitle } from '../Inspector';
+import { noteCacheStore } from './store';
 
 interface Props {
 	data: SDObject;
 }
 
-export default function Note(props: Props) {
-	// notes are cached in a store by their file id
-	// this is so we can ensure every note has been sent to Rust even
-	// when quickly navigating files, which cancels update function
-	const [note, setNote] = useState(props.data.note || '');
+export default function Note({ data }: Props) {
+	const setNote = useLibraryMutation('files.setNote');
 
-	const { mutate: fileSetNote } = useLibraryMutation('files.setNote');
+	const flush = useRef<() => void>();
+	const debouncedSetNote = useDebouncedCallback((note: string) => {
+		setNote.mutate({
+			id: data.id,
+			note
+		});
+	}, 500);
 
-	const debounce = useDebouncedCallback(
-		(note: string) =>
-			fileSetNote({
-				id: props.data.id,
-				note
-			}),
-		2000
-	);
+	// Flush debounced note change when component unmounts
+	flush.current = debouncedSetNote.flush;
 
-	// eslint-disable-next-line react-hooks/exhaustive-deps
-	const debouncedNote = useCallback((note: string) => debounce(note), [props.data.id, fileSetNote]);
+	// Cleanup on unmount
+	useEffect(() => () => flush.current?.(), []);
 
-	// when input is updated, cache note
-	function handleNoteUpdate(e: React.ChangeEvent<HTMLTextAreaElement>) {
-		if (e.target.value !== note) {
-			setNote(e.target.value);
-			debouncedNote(e.target.value);
+	// Use Valtio snapshot to manage cached notes
+	const noteSnapshot = useSnapshot(noteCacheStore);
+
+	// Prioritize cached value unless backend value is different, then update
+	useEffect(() => {
+		const cachedNote = noteCacheStore[data.id];
+		if (cachedNote === undefined || cachedNote === data.note) {
+			// If no cached value or cached value equals backend value, update store with backend value
+			noteCacheStore[data.id] = data.note ?? undefined;
 		}
-	}
+	}, [data]);
+
+	const { t } = useLocale();
 
 	return (
 		<>
 			<Divider />
 			<MetaContainer>
-				<MetaTitle>Note</MetaTitle>
+				<MetaTitle>{t('note')}</MetaTitle>
 				<TextArea
-					className="mt-2 mb-1 !py-2 text-xs leading-snug"
-					value={note || ''}
-					onChange={handleNoteUpdate}
-				/>{' '}
+					className="mb-1 mt-2 !py-2 text-xs leading-snug"
+					value={noteSnapshot[data.id] ?? ''}
+					onChange={(e) => {
+						noteCacheStore[data.id] = e.target.value;
+						debouncedSetNote(e.target.value);
+					}}
+				/>
 			</MetaContainer>
 		</>
 	);
